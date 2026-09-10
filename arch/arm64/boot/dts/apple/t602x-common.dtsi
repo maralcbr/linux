@@ -589,6 +589,34 @@
 		clock-output-names = "clk_dispext1_die1";
 	};
 
+	clk_dispext2: clock-dispext2 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+		clock-output-names = "clk_dispext2";
+	};
+
+	clk_dispext2_die1: clock-dispext2-die1 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+		clock-output-names = "clk_dispext2_die1";
+	};
+
+	clk_dispext3: clock-dispext3 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+		clock-output-names = "clk_dispext3";
+	};
+
+	clk_dispext3_die1: clock-dispext3-die1 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+		clock-output-names = "clk_dispext3_die1";
+	};
+
 	/*
 	 * This is a fabulated representation of the input clock
 	 * to NCO since we don't know the true clock tree.

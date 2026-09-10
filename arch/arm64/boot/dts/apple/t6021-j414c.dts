@@ -17,6 +17,15 @@
 	model = "Apple MacBook Pro (14-inch, M2 Max, 2023)";
 };
 
+/* M2 Max wires two more external display pipelines than M2 Pro; the shared
+ * board file only aliases the first two. m1n1 enables a dcpext node only when
+ * an alias of the same name resolves, so name them here. */
+&{/aliases} {
+	/* dcpext2/dcpext3 exist but stay unaliased: enabling them trips a NULL
+	 * dcp->rtk in systemep_init() via dcp_start(), because the component
+	 * aggregate binds before every DCP has finished probing. */
+};
+
 &wifi0 {
 	brcm,board-type = "apple,tokara";
 };

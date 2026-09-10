@@ -18,6 +18,14 @@
 };
 
 /delete-node/ &pmgr_south;
+/delete-node/ &dcpext2;
+/delete-node/ &dcpext2_mbox;
+/delete-node/ &dcpext2_dart;
+/delete-node/ &dispext2_dart;
+/delete-node/ &dcpext3;
+/delete-node/ &dcpext3_mbox;
+/delete-node/ &dcpext3_dart;
+/delete-node/ &dispext3_dart;
 /delete-node/ &pmp_report_dispext2;
 /delete-node/ &pmp_report_dispext3;
 /delete-node/ &pmp_report_venc1;
