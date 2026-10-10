@@ -4866,6 +4866,7 @@ void dwc3_gadget_exit(struct dwc3 *dwc)
 	kfree(dwc->setup_buf);
 	dma_free_coherent(dwc->sysdev, sizeof(*dwc->ep0_trb) * 2,
 			  dwc->ep0_trb, dwc->ep0_trb_addr);
+	dwc->gadget = NULL;
 }
 EXPORT_SYMBOL_GPL(dwc3_gadget_exit);
 
