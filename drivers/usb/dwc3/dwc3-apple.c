@@ -548,6 +548,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	appledwc->dev = &pdev->dev;
 	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev);
 	mutex_init(&appledwc->lock);
+	/*
+	 * dwc3_core_probe() only runs once a cable arrives, but remove() and the
+	 * PM callbacks look the glue up through the drvdata from the start.
+	 */
+	platform_set_drvdata(pdev, &appledwc->dwc);
 
 	appledwc->reset = devm_reset_control_get_exclusive(dev, NULL);
 	if (IS_ERR(appledwc->reset))
