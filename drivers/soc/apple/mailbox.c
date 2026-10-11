@@ -16,6 +16,7 @@
  * other direction.
  */
 
+#include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/delay.h>
@@ -28,8 +29,11 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/pm_wakeup.h>
 #include <linux/soc/apple/mailbox.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
+#include <linux/timekeeping.h>
 #include <linux/types.h>
 
 #define APPLE_ASC_MBOX_CONTROL_FULL BIT(16)
@@ -113,6 +117,68 @@ static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_RECV0 ==
 #define APPLE_MBOX_MSG1_MSG GENMASK(31, 0)
 
 #define APPLE_MBOX_TX_TIMEOUT 500
+
+/* LAB ONLY: piggyback on existing j314s AOP traffic, never add a timer IRQ. */
+static unsigned int lab_s2idle_wake_ms;
+module_param(lab_s2idle_wake_ms, uint, 0644);
+MODULE_PARM_DESC(lab_s2idle_wake_ms,
+		 "LAB ONLY: wake j314s s2idle on AOP RX after this many ms from mailbox noirq suspend (0=off)");
+
+static struct apple_mbox *lab_aop_mbox;
+static atomic64_t lab_wake_deadline = ATOMIC64_INIT(0);
+
+static void apple_mbox_lab_wake(struct apple_mbox *mbox)
+{
+	u64 deadline;
+
+	if (mbox != READ_ONCE(lab_aop_mbox))
+		return;
+	deadline = atomic64_read(&lab_wake_deadline);
+	if (!deadline || ktime_get_boottime_ns() < deadline)
+		return;
+	if (atomic64_cmpxchg(&lab_wake_deadline, deadline, 0) == deadline) {
+		pm_system_wakeup();
+		dev_info(mbox->dev, "LAB ONLY: AOP timed s2idle wake\n");
+	}
+}
+
+static int apple_mbox_lab_suspend_noirq(struct device *dev)
+{
+	struct apple_mbox *mbox = dev_get_drvdata(dev);
+	unsigned int ms;
+
+	if (mbox != READ_ONCE(lab_aop_mbox))
+		return 0;
+	atomic64_set(&lab_wake_deadline, 0);
+	ms = READ_ONCE(lab_s2idle_wake_ms);
+	if (ms && pm_suspend_target_state == PM_SUSPEND_TO_IDLE) {
+		/* Boot time includes the intervals timekeeping is frozen in s2idle. */
+		atomic64_set(&lab_wake_deadline,
+			     ktime_get_boottime_ns() + (u64)ms * NSEC_PER_MSEC);
+		dev_info(dev, "LAB ONLY: AOP wake armed for %u ms\n", ms);
+	}
+	return 0;
+}
+
+static int apple_mbox_lab_resume_noirq(struct device *dev)
+{
+	if (dev_get_drvdata(dev) == READ_ONCE(lab_aop_mbox))
+		atomic64_set(&lab_wake_deadline, 0);
+	return 0;
+}
+
+static const struct dev_pm_ops apple_mbox_lab_pm_ops = {
+	.suspend_noirq = apple_mbox_lab_suspend_noirq,
+	.resume_noirq = apple_mbox_lab_resume_noirq,
+};
+
+static void apple_mbox_lab_release(void *data)
+{
+	if (data == READ_ONCE(lab_aop_mbox)) {
+		atomic64_set(&lab_wake_deadline, 0);
+		WRITE_ONCE(lab_aop_mbox, NULL);
+	}
+}
 
 struct apple_mbox_hw {
 	unsigned int reg_offset;
@@ -420,6 +486,7 @@ static irqreturn_t apple_mbox_recv_irq(int irq, void *data)
 	if (likely(!READ_ONCE(mbox->removing)))
 		apple_mbox_poll_locked(mbox);
 	spin_unlock(&mbox->rx_lock);
+	apple_mbox_lab_wake(mbox);
 
 	return IRQ_HANDLED;
 }
@@ -764,6 +831,15 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	/* Restrict this disposable lab hook to the owner's j314s AOP mailbox. */
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (of_machine_is_compatible("apple,j314s") && res &&
+	    res->start == 0x293408000ULL) {
+		WRITE_ONCE(lab_aop_mbox, mbox);
+		ret = devm_add_action_or_reset(dev, apple_mbox_lab_release, mbox);
+		if (ret)
+			return ret;
+	}
 	platform_set_drvdata(pdev, mbox);
 	return 0;
 }
@@ -772,6 +848,7 @@ static void apple_mbox_remove(struct platform_device *pdev)
 {
 	struct apple_mbox *mbox = platform_get_drvdata(pdev);
 
+	apple_mbox_lab_release(mbox);
 	/* Block new phandle lookups before quiescing the provider. */
 	platform_set_drvdata(pdev, NULL);
 	apple_mbox_quiesce(mbox);
@@ -893,6 +970,7 @@ static struct platform_driver apple_mbox_driver = {
 	.driver = {
 		.name = "apple-mailbox",
 		.of_match_table = apple_mbox_of_match,
+		.pm = &apple_mbox_lab_pm_ops,
 	},
 	.probe = apple_mbox_probe,
 	.remove = apple_mbox_remove,
