@@ -2157,12 +2157,14 @@ static int apple_nhi_prepare(struct device *dev)
 }
 
 /*
- * ACIO stays powered through suspend-to-idle and keeps its links trained, so
- * nothing ever completes a router sleep request. Leave the routers awake.
+ * Router sleep saves power but ACIO retraining can stall after resume.
+ * Keep it opt-in until remote-transport recovery is qualified on hardware.
+ * An explicit Y also drops KEEP_TUNNELS and rebuilds tunnels on resume.
  */
 static bool router_sleep;
 module_param(router_sleep, bool, 0644);
-MODULE_PARM_DESC(router_sleep, "Ask routers to sleep on system suspend (test only)");
+MODULE_PARM_DESC(router_sleep,
+		 "Ask routers to sleep on system suspend (default N; experimental, rebuilds tunnels)");
 
 static bool apple_nhi_pcie_link_kept(struct apple_cio *acio)
 {
