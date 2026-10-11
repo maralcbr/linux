@@ -392,6 +392,7 @@ struct tb *tb_domain_alloc(struct tb_nhi *nhi, int timeout_msec, size_t privsize
 
 	tb->nhi = nhi;
 	mutex_init(&tb->lock);
+	atomic64_set(&tb->remote_activity, 0);
 
 	tb->index = ida_alloc(&tb_domain_ida, GFP_KERNEL);
 	if (tb->index < 0)

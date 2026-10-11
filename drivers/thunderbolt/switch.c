@@ -477,6 +477,7 @@ int tb_port_state(struct tb_port *port)
 		return res;
 	return phy.state;
 }
+EXPORT_SYMBOL_NS_GPL(tb_port_state, "USB4");
 
 /**
  * tb_wait_for_port() - wait for a port to become ready
@@ -2482,6 +2483,9 @@ struct tb_switch *tb_switch_alloc(struct tb *tb, struct device *parent,
 	if (ret)
 		goto err_free_sw_ports;
 
+	if (route)
+		atomic64_inc(&tb->remote_activity);
+
 	sw->generation = tb_switch_get_generation(sw);
 
 	tb_dbg(tb, "current switch config:\n");
@@ -3552,6 +3556,8 @@ int tb_switch_resume(struct tb_switch *sw, bool runtime)
 			tb_sw_info(sw, "switch not present anymore\n");
 			return err;
 		}
+
+		atomic64_inc(&sw->tb->remote_activity);
 
 		/* We don't have any way to confirm this was the same device */
 		if (!sw->uid)

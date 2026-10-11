@@ -144,6 +144,17 @@ static const struct apple_cio_hw apple_cio_t6030_hw = {
 #define APPLE_CIO_NHI_BOOT_TIMEOUT_MS 10000
 #define APPLE_CIO_PCIEC_READY_DELAY_MS 300
 
+/* Observation only: no extra control requests or downstream enumeration. */
+#define APPLE_CIO_RESUME_LINK_WAIT_MS 90000
+#define APPLE_CIO_RESUME_LINK_CHECK_MS 5000
+
+static bool resume_recovery;
+module_param(resume_recovery, bool, 0644);
+MODULE_PARM_DESC(resume_recovery,
+		 "Recover missing post-resume discovery once per driver load (default N)");
+/* Shared by all ACIO ports; never refilled by suspend or cable changes. */
+static atomic_t resume_recovery_used = ATOMIC_INIT(0);
+
 #define APPLE_CIO_START_RETRIES 5
 #define APPLE_CIO_START_RETRY_DELAY_MS 100
 
@@ -194,6 +205,14 @@ struct apple_cio {
 
 	struct mutex lock; /* serializes cable transitions and ACIO power up/down */
 	bool removing; /* protected by lock */
+	struct delayed_work resume_link_work;
+	unsigned int resume_link_failures; /* protected by lock */
+	u64 resume_activity; /* snapshot before the stock resume path */
+	bool resume_had_peer; /* peer present before suspend */
+	bool resume_recovery_active; /* forced cable cycle is in progress */
+	bool resume_recovery_failed; /* terminal recovery failure */
+	bool resume_link_failed; /* protected by lock */
+	bool resume_link_pending; /* set by NHI resume, consumed by ACIO complete */
 
 	u32 current_cable_info;
 	u32 target_cable_info;
@@ -2116,6 +2135,18 @@ static int apple_nhi_prepare(struct device *dev)
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
 	struct apple_cio *acio = anhi->acio;
 
+	acio->resume_had_peer = false;
+	scoped_guard(mutex, &anhi->tb->lock) {
+		struct tb_port *port;
+
+		tb_switch_for_each_port(anhi->tb->root_switch, port) {
+			if (tb_port_is_null(port) &&
+			    ((port->xdomain && !port->xdomain->is_unplugged) ||
+			     (port->remote && !port->remote->sw->is_unplugged)))
+				acio->resume_had_peer = true;
+		}
+	}
+
 	apple_dpin_pause_retries(acio);
 
 	guard(mutex)(&acio->pcie_tunnel_lock);
@@ -2166,6 +2197,8 @@ static int apple_nhi_resume_noirq(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
 
+	anhi->acio->resume_activity = atomic64_read(&anhi->tb->remote_activity);
+	WRITE_ONCE(anhi->acio->resume_link_pending, true);
 	return tb_domain_resume_noirq(anhi->tb);
 }
 
@@ -2300,6 +2333,8 @@ static void apple_cio_stop(struct apple_cio *acio)
 	int ret, i;
 
 	lockdep_assert_held(&acio->lock);
+	if (!acio->current_cable_info)
+		return;
 	apple_cio_remove_children(acio);
 
 	/* Try to shut down and power off the co-processor gracefully */
@@ -2308,6 +2343,7 @@ static void apple_cio_stop(struct apple_cio *acio)
 		dev_warn(acio->dev,
 			 "Failed to shutdown M3 RTKit, continuing ACIO shutdown anyway\n");
 	apple_rtkit_free(acio->rtk);
+	acio->rtk = NULL;
 
 	/* Finally, remove the links to the PD domains to power everything off */
 	for (i = 0; i < acio->pd_list->num_pds; i++) {
@@ -2318,6 +2354,7 @@ static void apple_cio_stop(struct apple_cio *acio)
 	}
 
 	acio->current_cable_info = 0;
+	acio->resume_link_failed = false;
 }
 
 /* Only called while the ACIO power domains are on. */
@@ -2338,7 +2375,7 @@ static void apple_cio_log_state(struct apple_cio *acio, const char *when)
 static int apple_cio_start(struct apple_cio *acio)
 {
 	struct device_link *link;
-	int i, ret;
+	int i, ret, attempts;
 	u32 state, val;
 
 	lockdep_assert_held(&acio->lock);
@@ -2387,14 +2424,15 @@ static int apple_cio_start(struct apple_cio *acio)
 	 * After the power domains are on we need to signal and wait for the ACIO block
 	 * to actually start before we can bring up the co-processor.
 	 */
-	for (i = 0; i < APPLE_CIO_START_RETRIES; i++) {
+	attempts = acio->resume_recovery_active ? 1 : APPLE_CIO_START_RETRIES;
+	for (i = 0; i < attempts; i++) {
 		ret = reset_control_deassert(acio->reset);
 		if (!ret)
 			break;
-		if (i + 1 < APPLE_CIO_START_RETRIES) {
+		if (i + 1 < attempts) {
 			dev_warn(acio->dev,
 				 "ACIO block failed to start (attempt %d/%d): %d, retrying\n",
-				 i + 1, APPLE_CIO_START_RETRIES, ret);
+				 i + 1, attempts, ret);
 			msleep(APPLE_CIO_START_RETRY_DELAY_MS);
 		}
 	}
@@ -2501,7 +2539,9 @@ err_shutdown_rtkit:
 	apple_rtkit_poweroff(acio->rtk);
 err_free_rtkit:
 	apple_rtkit_free(acio->rtk);
+	acio->rtk = NULL;
 remove_links:
+	acio->rtk = NULL;
 	/* Cut power to reset the entire block  */
 	for (i = 0; i < acio->pd_list->num_pds; i++) {
 		if (acio->pd_list->pd_links[i])
@@ -2518,6 +2558,9 @@ static int apple_cio_check_connection(struct apple_cio *acio)
 	int ret;
 
 	lockdep_assert_held(&acio->lock);
+	/* Ask CD321x to cycle ACIO and the PHY using a fresh cable snapshot. */
+	if (acio->resume_link_failed)
+		return -ENOLINK;
 	guard(mutex)(&acio->pcie_tunnel_lock);
 	if (!READ_ONCE(acio->nhi_pdev) || acio->pcie_tunnel_stopping ||
 	    apple_rtkit_is_crashed(acio->rtk))
@@ -2541,6 +2584,116 @@ static int apple_cio_check_connection(struct apple_cio *acio)
 		acio->pcie_resume_expected = false;
 	return ret;
 }
+
+static int apple_cio_link_connected(struct apple_cio *acio)
+{
+	struct platform_device *pdev = READ_ONCE(acio->nhi_pdev);
+	struct apple_nhi *anhi;
+	struct tb_port *port;
+	int verdict = -EAGAIN;
+	u64 activity;
+
+	lockdep_assert_held(&acio->lock);
+	if (!pdev)
+		return -EAGAIN;
+	device_lock(&pdev->dev);
+	anhi = platform_get_drvdata(pdev);
+	if (!pdev->dev.driver || !anhi)
+		goto unlock;
+
+	scoped_guard(mutex, &anhi->tb->lock) {
+		activity = atomic64_read(&anhi->tb->remote_activity);
+		tb_switch_for_each_port(anhi->tb->root_switch, port) {
+			if (!tb_port_is_null(port))
+				continue;
+			dev_dbg(acio->dev,
+				"resume lane %u link %u: state/error %d, xdomain registered %d unplugged %d\n",
+				port->port, port->link_nr, tb_port_state(port),
+				port->xdomain && device_is_registered(&port->xdomain->dev),
+				port->xdomain && port->xdomain->is_unplugged);
+		}
+		/* ACIO exposes one physical cable per domain, including both lanes. */
+		verdict = activity != acio->resume_activity ? 0 : -ENOLINK;
+		dev_dbg(acio->dev, "resume discovery: activity %llu -> %llu, verdict %s\n",
+			acio->resume_activity, activity,
+			verdict ? "no fresh discovery (stale UP possible)" :
+			"fresh remote exchange");
+	}
+unlock:
+	device_unlock(&pdev->dev);
+	return verdict;
+}
+
+static void apple_cio_resume_link_work(struct work_struct *work)
+{
+	struct apple_cio *acio = container_of(to_delayed_work(work),
+						    struct apple_cio, resume_link_work);
+	bool notify = false;
+	int ret;
+
+	scoped_guard(mutex, &acio->lock) {
+		if (!READ_ONCE(resume_recovery) || acio->removing ||
+		    !acio->current_cable_info || !acio->target_cable_info ||
+		    acio->resume_recovery_failed)
+			return;
+		ret = apple_cio_link_connected(acio);
+		if (!ret || ret == -EAGAIN)
+			return;
+		if (++acio->resume_link_failures < 3) {
+			mod_delayed_work(system_freezable_wq, &acio->resume_link_work,
+					 msecs_to_jiffies(APPLE_CIO_RESUME_LINK_CHECK_MS));
+			return;
+		}
+		if (atomic_cmpxchg(&resume_recovery_used, 0, 1)) {
+			dev_warn(acio->dev, "resume recovery budget already used; leaving cable alone\n");
+			return;
+		}
+		acio->resume_link_failed = true;
+		acio->resume_recovery_active = true;
+		dev_info(acio->dev, "no fresh remote discovery after resume, revalidating cable once\n");
+		notify = true;
+	}
+
+	/* CD321x may tear down the NHI: never notify under either driver lock. */
+	if (notify)
+		typec_thunderbolt_switch_notify(acio->tbt_switch);
+}
+
+static int apple_cio_prepare(struct device *dev)
+{
+	struct apple_cio *acio = dev_get_drvdata(dev);
+
+	/* Drain before taking lock; the worker acquires it to check the link. */
+	cancel_delayed_work_sync(&acio->resume_link_work);
+	scoped_guard(mutex, &acio->lock) {
+		WRITE_ONCE(acio->resume_link_pending, false);
+		acio->resume_link_failed = false;
+	}
+	return 0;
+}
+
+static void apple_cio_complete(struct device *dev)
+{
+	struct apple_cio *acio = dev_get_drvdata(dev);
+
+	guard(mutex)(&acio->lock);
+	if (!READ_ONCE(acio->resume_link_pending))
+		return;
+	WRITE_ONCE(acio->resume_link_pending, false);
+	if (!READ_ONCE(resume_recovery) || acio->removing ||
+	    !acio->current_cable_info || !acio->resume_had_peer ||
+	    acio->resume_recovery_failed)
+		return;
+
+	acio->resume_link_failures = 0;
+	mod_delayed_work(system_freezable_wq, &acio->resume_link_work,
+			 msecs_to_jiffies(APPLE_CIO_RESUME_LINK_WAIT_MS));
+}
+
+static const struct dev_pm_ops apple_cio_pm_ops = {
+	.prepare = apple_cio_prepare,
+	.complete = apple_cio_complete,
+};
 
 static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 				    const struct typec_thunderbolt_switch_data *data)
@@ -2613,8 +2766,22 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 	 * Bring up or power down the ACIO complex
 	 * current_cable_info will be updated in the start/stop functions
 	 */
-	if (acio->target_cable_info)
-		return apple_cio_start(acio);
+	if (acio->target_cable_info) {
+		int ret;
+
+		if (acio->resume_recovery_failed)
+			return -ESHUTDOWN;
+		ret = apple_cio_start(acio);
+		if (ret && acio->resume_recovery_active) {
+			acio->resume_recovery_failed = true;
+			acio->target_cable_info = 0;
+			dev_err(acio->dev,
+				"resume recovery start failed: %d; port disabled\n", ret);
+			ret = -ESHUTDOWN;
+		}
+		acio->resume_recovery_active = false;
+		return ret;
+	}
 
 	apple_cio_stop(acio);
 	return 0;
@@ -2651,6 +2818,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 		return ret;
 	INIT_DELAYED_WORK(&acio->pcie_tunnel_work,
 			  apple_cio_pcie_tunnel_work);
+	INIT_DELAYED_WORK(&acio->resume_link_work, apple_cio_resume_link_work);
 	init_completion(&acio->nhi_boot_completion);
 	acio->dev = &pdev->dev;
 	acio->np = dev->of_node;
@@ -2828,6 +2996,7 @@ static void apple_cio_remove(struct platform_device *pdev)
 
 	apple_pcie_tunnel_unregister_notifier(&acio->pcie_notifier);
 
+	disable_delayed_work_sync(&acio->resume_link_work);
 	/* The worker can notify this switch; stop current and future enqueues. */
 	disable_delayed_work_sync(&acio->pcie_tunnel_work);
 	/* A set may hold the switch read lock while waiting for acio->lock. */
@@ -2858,6 +3027,7 @@ static struct platform_driver apple_cio_driver = {
 	.driver = {
 		.name = "thunderbolt-apple-acio",
 		.of_match_table = apple_acio_match,
+		.pm = &apple_cio_pm_ops,
 	},
 	.probe = apple_cio_probe,
 	.remove = apple_cio_remove,

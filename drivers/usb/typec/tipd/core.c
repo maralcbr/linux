@@ -1037,6 +1037,23 @@ static void cd321x_update_work(struct work_struct *work)
 	return;
 
 retry:
+	if (ret == -ESHUTDOWN) {
+		/* A terminal provider failure must not cycle the complex again. */
+		cd321x->state.alt = NULL;
+		cd321x->state.mode = TYPEC_STATE_SAFE;
+		cd321x->state.data = NULL;
+		if (typec_set_mode(tps->port, TYPEC_STATE_SAFE))
+			dev_warn(tps->dev, "failed to put shut-down provider PHY in safe mode\n");
+		if (usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE))
+			dev_warn(tps->dev, "failed to release shut-down provider USB role\n");
+		cd321x->pm.phase = CD321X_PM_STALE;
+		cd321x->pm.attempts_left = 0;
+		cd321x->pm.force_reconnect = false;
+		cd321x->pm.provider_busy = false;
+		cd321x->state_valid = false;
+		dev_err(tps->dev, "Type-C provider shut down; automatic retries stopped\n");
+		return;
+	}
 	/* A deferred PCIe activation is not evidence of a failed cable. */
 	cd321x_retry_revalidation(cd321x, ret != -EAGAIN);
 }

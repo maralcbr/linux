@@ -1236,6 +1236,7 @@ static int tb_xdomain_get_uuid(struct tb_xdomain *xd)
 		return ret;
 	}
 
+	atomic64_inc(&tb->remote_activity);
 	dev_dbg(&xd->dev, "got remote UUID %pUb\n", &uuid);
 
 	if (uuid_equal(&uuid, xd->local_uuid)) {
@@ -1429,6 +1430,8 @@ static int tb_xdomain_get_properties(struct tb_xdomain *xd)
 
 		return ret;
 	}
+
+	atomic64_inc(&tb->remote_activity);
 
 	mutex_lock(&xd->lock);
 
