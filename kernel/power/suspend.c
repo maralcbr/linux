@@ -9,6 +9,7 @@
 
 #define pr_fmt(fmt) "PM: " fmt
 
+#include <linux/atomic.h>
 #include <linux/string.h>
 #include <linux/delay.h>
 #include <linux/errno.h>
@@ -130,6 +131,15 @@ static void s2idle_enter(void)
 	trace_suspend_resume(TPS("machine_suspend"), PM_SUSPEND_TO_IDLE, false);
 }
 
+/* LAB ONLY: read by the AOP diagnostic module after an assisted resume. */
+static atomic64_t lab_s2idle_exits = ATOMIC64_INIT(0);
+
+u64 lab_s2idle_exit_count(void)
+{
+	return atomic64_read(&lab_s2idle_exits);
+}
+EXPORT_SYMBOL_GPL(lab_s2idle_exit_count);
+
 static void s2idle_loop(void)
 {
 	pm_pr_dbg("suspend-to-idle\n");
@@ -157,6 +167,7 @@ static void s2idle_loop(void)
 		s2idle_enter();
 	}
 
+	atomic64_inc(&lab_s2idle_exits);
 	pm_pr_dbg("resume from suspend-to-idle\n");
 }
 

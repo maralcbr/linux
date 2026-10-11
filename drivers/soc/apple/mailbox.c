@@ -16,6 +16,7 @@
  * other direction.
  */
 
+#include <clocksource/arm_arch_timer.h>
 #include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/bits.h>
@@ -32,9 +33,14 @@
 #include <linux/pm_wakeup.h>
 #include <linux/soc/apple/mailbox.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/suspend.h>
 #include <linux/timekeeping.h>
 #include <linux/types.h>
+
+#ifdef CONFIG_ARM64
+#include <asm/sysreg.h>
+#endif
 
 #define APPLE_ASC_MBOX_CONTROL_FULL BIT(16)
 #define APPLE_ASC_MBOX_CONTROL_EMPTY BIT(17)
@@ -125,47 +131,222 @@ MODULE_PARM_DESC(lab_s2idle_wake_ms,
 		 "LAB ONLY: wake j314s s2idle on AOP RX after this many ms from mailbox noirq suspend (0=off)");
 
 static struct apple_mbox *lab_aop_mbox;
+static struct device *lab_diag_dev;
 static atomic64_t lab_wake_deadline = ATOMIC64_INIT(0);
+
+/* LAB ONLY: retain evidence in RAM; never print from the receive IRQ. */
+struct apple_mbox_lab_sample {
+	u64 rx, checks, first_counter, last_counter, first_boot, last_boot;
+	u64 before, expired, no_deadline, wake_requests, deadline;
+	u64 first_check_boot, last_check_boot;
+};
+
+static DEFINE_RAW_SPINLOCK(lab_diag_lock);
+static struct apple_mbox_lab_sample lab_live, lab_resume;
+static bool lab_collect, lab_noirq, lab_match, lab_resume_seen;
+static bool lab_direct_complete, lab_syscore, lab_runtime_suspended;
+static bool lab_prepare_active, lab_prepare_removing, lab_selected;
+static unsigned int lab_ms, lab_target, lab_counter_rate;
+static int lab_prepare_irq;
+static u64 lab_prepare_counter, lab_prepare_boot, lab_noirq_counter;
+static u64 lab_noirq_boot, lab_exit_before, lab_exit_resume;
+static u64 lab_resume_counter, lab_resume_boot;
+static resource_size_t lab_resource;
+static char lab_prepare_compatible[64];
+
+static bool apple_mbox_lab_syscore(struct device *dev)
+{
+#ifdef CONFIG_PM_SLEEP
+	return dev && dev->power.syscore;
+#else
+	return false;
+#endif
+}
+
+static u32 apple_mbox_lab_counter_rate(void)
+{
+#ifdef CONFIG_ARM64
+	return read_sysreg(cntfrq_el0);
+#else
+	return 0;
+#endif
+}
+
+static void apple_mbox_lab_rx_entry(struct apple_mbox *mbox)
+{
+	unsigned long flags;
+	u64 counter, boot;
+
+	if (mbox != READ_ONCE(lab_aop_mbox) ||
+	    !READ_ONCE(lab_collect) || !atomic64_read(&lab_wake_deadline))
+		return;
+	counter = arch_timer_read_counter();
+	boot = ktime_get_boottime_ns();
+	raw_spin_lock_irqsave(&lab_diag_lock, flags);
+	if (lab_collect && atomic64_read(&lab_wake_deadline)) {
+		if (!lab_live.rx) {
+			lab_live.first_counter = counter;
+			lab_live.first_boot = boot;
+		}
+		lab_live.rx++;
+		lab_live.last_counter = counter;
+		lab_live.last_boot = boot;
+	}
+	raw_spin_unlock_irqrestore(&lab_diag_lock, flags);
+}
 
 static void apple_mbox_lab_wake(struct apple_mbox *mbox)
 {
-	u64 deadline;
+	unsigned long flags;
+	u64 deadline, boot;
+	bool wake = false;
 
-	if (mbox != READ_ONCE(lab_aop_mbox))
+	if (mbox != READ_ONCE(lab_aop_mbox) || !READ_ONCE(lab_collect))
 		return;
+	boot = ktime_get_boottime_ns();
+	raw_spin_lock_irqsave(&lab_diag_lock, flags);
 	deadline = atomic64_read(&lab_wake_deadline);
-	if (!deadline || ktime_get_boottime_ns() < deadline)
-		return;
-	if (atomic64_cmpxchg(&lab_wake_deadline, deadline, 0) == deadline) {
-		pm_system_wakeup();
-		dev_info(mbox->dev, "LAB ONLY: AOP timed s2idle wake\n");
+	if (lab_collect) {
+		if (!lab_live.checks)
+			lab_live.first_check_boot = boot;
+		lab_live.last_check_boot = boot;
+		lab_live.checks++;
+		if (!deadline)
+			lab_live.no_deadline++;
+		else if (boot < deadline)
+			lab_live.before++;
+		else
+			lab_live.expired++;
 	}
+	if (deadline && boot >= deadline &&
+	    atomic64_cmpxchg(&lab_wake_deadline, deadline, 0) == deadline) {
+		lab_live.wake_requests++;
+		wake = true;
+	}
+	raw_spin_unlock_irqrestore(&lab_diag_lock, flags);
+	if (wake)
+		pm_system_wakeup();
 }
 
 static int apple_mbox_lab_suspend_noirq(struct device *dev)
 {
 	struct apple_mbox *mbox = dev_get_drvdata(dev);
-	unsigned int ms;
+	unsigned long flags;
 
-	if (mbox != READ_ONCE(lab_aop_mbox))
+	/* Record callback arrival even if probe did not select the target. */
+	if (dev != READ_ONCE(lab_diag_dev))
 		return 0;
+	raw_spin_lock_irqsave(&lab_diag_lock, flags);
+	lab_noirq = true;
+	lab_match = mbox && mbox == READ_ONCE(lab_aop_mbox);
+	lab_direct_complete = dev->power.direct_complete;
+	lab_syscore = apple_mbox_lab_syscore(dev);
+	lab_runtime_suspended = pm_runtime_status_suspended(dev);
+	lab_target = pm_suspend_target_state;
+	lab_noirq_counter = arch_timer_read_counter();
+	lab_noirq_boot = ktime_get_boottime_ns();
 	atomic64_set(&lab_wake_deadline, 0);
-	ms = READ_ONCE(lab_s2idle_wake_ms);
-	if (ms && pm_suspend_target_state == PM_SUSPEND_TO_IDLE) {
-		/* Boot time includes the intervals timekeeping is frozen in s2idle. */
-		atomic64_set(&lab_wake_deadline,
-			     ktime_get_boottime_ns() + (u64)ms * NSEC_PER_MSEC);
-		dev_info(dev, "LAB ONLY: AOP wake armed for %u ms\n", ms);
+	if (lab_match && lab_ms && lab_target == PM_SUSPEND_TO_IDLE) {
+		lab_live.deadline = lab_noirq_boot + (u64)lab_ms * NSEC_PER_MSEC;
+		atomic64_set(&lab_wake_deadline, lab_live.deadline);
+		lab_collect = true;
 	}
+	raw_spin_unlock_irqrestore(&lab_diag_lock, flags);
 	return 0;
 }
 
 static int apple_mbox_lab_resume_noirq(struct device *dev)
 {
-	if (dev_get_drvdata(dev) == READ_ONCE(lab_aop_mbox))
-		atomic64_set(&lab_wake_deadline, 0);
+	unsigned long flags;
+
+	if (dev != READ_ONCE(lab_diag_dev))
+		return 0;
+	raw_spin_lock_irqsave(&lab_diag_lock, flags);
+	lab_resume_counter = arch_timer_read_counter();
+	lab_resume_boot = ktime_get_boottime_ns();
+	lab_resume = lab_live;
+	lab_resume.deadline = atomic64_read(&lab_wake_deadline);
+	lab_exit_resume = lab_s2idle_exit_count();
+	lab_resume_seen = true;
+	lab_collect = false;
+	atomic64_set(&lab_wake_deadline, 0);
+	raw_spin_unlock_irqrestore(&lab_diag_lock, flags);
 	return 0;
 }
+
+static int apple_mbox_lab_notify(struct notifier_block *nb,
+				unsigned long event, void *unused)
+{
+	struct device *dev = READ_ONCE(lab_diag_dev);
+	struct apple_mbox *mbox;
+	struct apple_mbox_lab_sample sample;
+	struct device_node *root;
+	unsigned long flags;
+	const char *compatible = "missing";
+
+	if (event == PM_SUSPEND_PREPARE) {
+		root = of_find_node_by_path("/");
+		if (root)
+			of_property_read_string(root, "compatible", &compatible);
+		strscpy(lab_prepare_compatible, compatible,
+			sizeof(lab_prepare_compatible));
+		of_node_put(root);
+		mbox = dev ? dev_get_drvdata(dev) : NULL;
+		raw_spin_lock_irqsave(&lab_diag_lock, flags);
+		memset(&lab_live, 0, sizeof(lab_live));
+		memset(&lab_resume, 0, sizeof(lab_resume));
+		lab_collect = lab_noirq = lab_match = lab_resume_seen = false;
+		lab_ms = READ_ONCE(lab_s2idle_wake_ms);
+		lab_selected = mbox && mbox == READ_ONCE(lab_aop_mbox);
+		lab_prepare_irq = mbox ? mbox->irq_recv_not_empty : -1;
+		lab_prepare_active = mbox && READ_ONCE(mbox->active);
+		lab_prepare_removing = mbox && READ_ONCE(mbox->removing);
+		lab_direct_complete = dev && dev->power.direct_complete;
+		lab_syscore = apple_mbox_lab_syscore(dev);
+		lab_runtime_suspended = dev && pm_runtime_status_suspended(dev);
+		lab_target = pm_suspend_target_state;
+		lab_noirq_counter = lab_noirq_boot = 0;
+		lab_resume_counter = lab_resume_boot = 0;
+		lab_prepare_counter = arch_timer_read_counter();
+		lab_prepare_boot = ktime_get_boottime_ns();
+		lab_counter_rate = apple_mbox_lab_counter_rate();
+		lab_exit_before = lab_s2idle_exit_count();
+		lab_exit_resume = lab_exit_before;
+		raw_spin_unlock_irqrestore(&lab_diag_lock, flags);
+	} else if (event == PM_POST_SUSPEND) {
+		raw_spin_lock_irqsave(&lab_diag_lock, flags);
+		sample = lab_resume_seen ? lab_resume : lab_live;
+		lab_collect = false;
+		raw_spin_unlock_irqrestore(&lab_diag_lock, flags);
+		pr_info("AOP-WAKE-DIAG BEGIN\n");
+		pr_info("AOP-WAKE-DIAG PREPARE ms=%u compatible=%s resource=%pa selected=%u irq=%d active=%u removing=%u counter=%llu boot=%llu rate=%u\n",
+			 lab_ms, lab_prepare_compatible, &lab_resource, lab_selected,
+			 lab_prepare_irq, lab_prepare_active,
+			 lab_prepare_removing, lab_prepare_counter, lab_prepare_boot,
+			 lab_counter_rate);
+		pr_info("AOP-WAKE-DIAG NOIRQ reached=%u match=%u target=%u direct_complete=%u syscore=%u runtime_suspended=%u counter=%llu boot=%llu armed_deadline=%llu\n",
+			 lab_noirq, lab_match, lab_target, lab_direct_complete,
+			 lab_syscore, lab_runtime_suspended, lab_noirq_counter,
+			 lab_noirq_boot, lab_live.deadline);
+		pr_info("AOP-WAKE-DIAG RX entries=%llu post_checks=%llu first_counter=%llu last_counter=%llu first_boot=%llu last_boot=%llu before=%llu expired=%llu no_deadline=%llu wake_requests=%llu first_check_boot=%llu last_check_boot=%llu last_delta_ns=%lld\n",
+			 sample.rx, sample.checks, sample.first_counter,
+			 sample.last_counter, sample.first_boot, sample.last_boot,
+			 sample.before, sample.expired, sample.no_deadline,
+			 sample.wake_requests, sample.first_check_boot,
+			 sample.last_check_boot,
+			 (s64)(sample.last_check_boot - lab_live.deadline));
+		pr_info("AOP-WAKE-DIAG RESUME_NOIRQ reached=%u pending_deadline=%llu counter=%llu boot=%llu exits_before=%llu exits_resume=%llu exits_post=%llu\n",
+			 lab_resume_seen, sample.deadline, lab_resume_counter,
+			 lab_resume_boot, lab_exit_before,
+			 lab_exit_resume, lab_s2idle_exit_count());
+		pr_info("AOP-WAKE-DIAG END\n");
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block lab_diag_notifier = {
+	.notifier_call = apple_mbox_lab_notify,
+};
 
 static const struct dev_pm_ops apple_mbox_lab_pm_ops = {
 	.suspend_noirq = apple_mbox_lab_suspend_noirq,
@@ -482,6 +663,7 @@ static irqreturn_t apple_mbox_recv_irq(int irq, void *data)
 {
 	struct apple_mbox *mbox = data;
 
+	apple_mbox_lab_rx_entry(mbox);
 	spin_lock(&mbox->rx_lock);
 	if (likely(!READ_ONCE(mbox->removing)))
 		apple_mbox_poll_locked(mbox);
@@ -841,6 +1023,11 @@ static int apple_mbox_probe(struct platform_device *pdev)
 			return ret;
 	}
 	platform_set_drvdata(pdev, mbox);
+	/* Retain identity even if the live DT fails the board-selection check. */
+	if (res && res->start == 0x293408000ULL) {
+		lab_resource = res->start;
+		WRITE_ONCE(lab_diag_dev, dev);
+	}
 	return 0;
 }
 
@@ -848,6 +1035,8 @@ static void apple_mbox_remove(struct platform_device *pdev)
 {
 	struct apple_mbox *mbox = platform_get_drvdata(pdev);
 
+	if (READ_ONCE(lab_diag_dev) == &pdev->dev)
+		WRITE_ONCE(lab_diag_dev, NULL);
 	apple_mbox_lab_release(mbox);
 	/* Block new phandle lookups before quiescing the provider. */
 	platform_set_drvdata(pdev, NULL);
@@ -975,7 +1164,27 @@ static struct platform_driver apple_mbox_driver = {
 	.probe = apple_mbox_probe,
 	.remove = apple_mbox_remove,
 };
-module_platform_driver(apple_mbox_driver);
+/* Register globally so POST_SUSPEND also exposes an absent AOP provider. */
+static int __init apple_mbox_lab_init(void)
+{
+	int ret;
+
+	ret = register_pm_notifier(&lab_diag_notifier);
+	if (ret)
+		return ret;
+	ret = platform_driver_register(&apple_mbox_driver);
+	if (ret)
+		unregister_pm_notifier(&lab_diag_notifier);
+	return ret;
+}
+module_init(apple_mbox_lab_init);
+
+static void __exit apple_mbox_lab_exit(void)
+{
+	unregister_pm_notifier(&lab_diag_notifier);
+	platform_driver_unregister(&apple_mbox_driver);
+}
+module_exit(apple_mbox_lab_exit);
 
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
