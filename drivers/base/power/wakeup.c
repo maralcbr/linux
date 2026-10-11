@@ -894,6 +894,7 @@ EXPORT_SYMBOL_GPL(pm_wakeup_pending);
 
 void pm_system_wakeup(void)
 {
+	lab_s2idle_trace_step("system.wakeup", 0, 0);
 	atomic_inc(&pm_abort_suspend);
 	s2idle_wake();
 }

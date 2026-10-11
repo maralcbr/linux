@@ -51,6 +51,7 @@
  * Copyright (c) Sven Peter <sven@kernel.org>
  */
 
+#include <linux/suspend.h>
 #include <linux/bitfield.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
@@ -2204,6 +2205,7 @@ static bool apple_nhi_pcie_link_kept(struct apple_cio *acio)
 static int apple_nhi_suspend_noirq(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
+	int ret;
 
 	anhi->nhi.quirks &= ~(QUIRK_NO_SYSTEM_SLEEP | QUIRK_KEEP_TUNNELS);
 	if (!READ_ONCE(router_sleep)) {
@@ -2213,16 +2215,23 @@ static int apple_nhi_suspend_noirq(struct device *dev)
 			anhi->nhi.quirks |= QUIRK_KEEP_TUNNELS;
 	}
 
-	return tb_domain_suspend_noirq(anhi->tb);
+	lab_s2idle_trace_step("nhi.suspend.begin", anhi->tb->index, anhi->nhi.quirks);
+	ret = tb_domain_suspend_noirq(anhi->tb);
+	lab_s2idle_trace_step("nhi.suspend.end", anhi->tb->index, ret);
+	return ret;
 }
 
 static int apple_nhi_resume_noirq(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
+	int ret;
 
 	anhi->acio->resume_activity = atomic64_read(&anhi->tb->remote_activity);
 	WRITE_ONCE(anhi->acio->resume_link_pending, true);
-	return tb_domain_resume_noirq(anhi->tb);
+	lab_s2idle_trace_step("nhi.resume.begin", anhi->tb->index, anhi->nhi.quirks);
+	ret = tb_domain_resume_noirq(anhi->tb);
+	lab_s2idle_trace_step("nhi.resume.end", anhi->tb->index, ret);
+	return ret;
 }
 
 static int apple_nhi_freeze_noirq(struct device *dev)

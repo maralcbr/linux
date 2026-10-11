@@ -142,6 +142,7 @@ EXPORT_SYMBOL_GPL(lab_s2idle_exit_count);
 
 static void s2idle_loop(void)
 {
+	lab_s2idle_trace_step("s2idle.enter", 0, 0);
 	pm_pr_dbg("suspend-to-idle\n");
 
 	/*
@@ -167,6 +168,7 @@ static void s2idle_loop(void)
 		s2idle_enter();
 	}
 
+	lab_s2idle_trace_step("s2idle.exit", 0, 0);
 	atomic64_inc(&lab_s2idle_exits);
 	pm_pr_dbg("resume from suspend-to-idle\n");
 }
@@ -444,7 +446,9 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 	if (error)
 		goto Devices_early_resume;
 
+	lab_s2idle_trace_step("devices.suspend_noirq.begin", 0, 0);
 	error = dpm_suspend_noirq(PMSG_SUSPEND);
+	lab_s2idle_trace_step("devices.suspend_noirq.end", 0, error);
 	if (error) {
 		pr_err("noirq suspend of devices failed\n");
 		goto Platform_early_resume;
@@ -495,7 +499,9 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 
  Platform_wake:
 	platform_resume_noirq(state);
+	lab_s2idle_trace_step("devices.resume_noirq.begin", 0, 0);
 	dpm_resume_noirq(PMSG_RESUME);
+	lab_s2idle_trace_step("devices.resume_noirq.end", 0, 0);
 
  Platform_early_resume:
 	platform_resume_early(state);

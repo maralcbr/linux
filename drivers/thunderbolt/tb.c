@@ -6,6 +6,7 @@
  * Copyright (C) 2019, Intel Corporation
  */
 
+#include <linux/suspend.h>
 #include <linux/export.h>
 #include <linux/slab.h>
 #include <linux/errno.h>
@@ -3173,7 +3174,9 @@ static int tb_suspend_noirq(struct tb *tb)
 	if (!(tb->nhi->quirks & QUIRK_KEEP_TUNNELS))
 		tb_disconnect_and_release_dp(tb);
 	tb_switch_exit_redrive(tb->root_switch);
+	lab_s2idle_trace_step("router.suspend.begin", tb->index, tb->nhi->quirks);
 	tb_switch_suspend(tb->root_switch, false);
+	lab_s2idle_trace_step("router.suspend.end", tb->index, 0);
 	tcm->hotplug_active = false; /* signal tb_handle_hotplug to quit */
 	tb_dbg(tb, "suspend finished\n");
 
@@ -3217,6 +3220,7 @@ static int tb_resume_noirq(struct tb *tb)
 	struct tb_cm *tcm = tb_priv(tb);
 	struct tb_tunnel *tunnel, *n;
 	unsigned int usb3_delay = 0;
+	int ret;
 	LIST_HEAD(tunnels);
 
 	tb_dbg(tb, "resuming...\n");
@@ -3225,13 +3229,20 @@ static int tb_resume_noirq(struct tb *tb)
 	 * For non-USB4 hosts (Apple systems) remove any PCIe devices
 	 * the firmware might have setup.
 	 */
-	if (!tb_switch_is_usb4(tb->root_switch))
-		tb_switch_reset(tb->root_switch);
+	if (!tb_switch_is_usb4(tb->root_switch)) {
+		lab_s2idle_trace_step("router.reset.begin", tb->index, 0);
+		ret = tb_switch_reset(tb->root_switch);
+		lab_s2idle_trace_step("router.reset.end", tb->index, ret);
+	}
 
-	tb_switch_resume(tb->root_switch, false);
+	lab_s2idle_trace_step("router.resume.begin", tb->index, 0);
+	ret = tb_switch_resume(tb->root_switch, false);
+	lab_s2idle_trace_step("router.resume.end", tb->index, ret);
 	tb_free_invalid_tunnels(tb);
 	tb_free_unplugged_children(tb->root_switch);
+	lab_s2idle_trace_step("children.restore.begin", tb->index, 0);
 	tb_restore_children(tb->root_switch);
+	lab_s2idle_trace_step("children.restore.end", tb->index, 0);
 
 	/*
 	 * Routers that stayed awake still carry our tunnels. Restarting them
@@ -3248,6 +3259,7 @@ static int tb_resume_noirq(struct tb *tb)
 	 * we cannot be sure they are usable for us we find and tear
 	 * them down.
 	 */
+	lab_s2idle_trace_step("tunnels.restore.begin", tb->index, 0);
 	tb_switch_discover_tunnels(tb->root_switch, &tunnels, false);
 	list_for_each_entry_safe_reverse(tunnel, n, &tunnels, list) {
 		if (tb_tunnel_is_usb3(tunnel))
@@ -3275,6 +3287,7 @@ static int tb_resume_noirq(struct tb *tb)
 		msleep(100);
 	}
 out:
+	lab_s2idle_trace_step("tunnels.restore.end", tb->index, tb->nhi->quirks);
 	tb_switch_enter_redrive(tb->root_switch);
 	 /* Allow tb_handle_hotplug to progress events */
 	tcm->hotplug_active = true;

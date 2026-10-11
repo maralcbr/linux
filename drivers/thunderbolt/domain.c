@@ -6,6 +6,7 @@
  * Author: Mika Westerberg <mika.westerberg@linux.intel.com>
  */
 
+#include <linux/suspend.h>
 #include <linux/device.h>
 #include <linux/idr.h>
 #include <linux/module.h>
@@ -540,8 +541,11 @@ int tb_domain_suspend_noirq(struct tb *tb)
 	mutex_lock(&tb->lock);
 	if (tb->cm_ops->suspend_noirq)
 		ret = tb->cm_ops->suspend_noirq(tb);
-	if (!ret)
+	if (!ret) {
+		lab_s2idle_trace_step("ctl.stop.begin", tb->index, 0);
 		tb_ctl_stop(tb->ctl);
+		lab_s2idle_trace_step("ctl.stop.end", tb->index, 0);
+	}
 	mutex_unlock(&tb->lock);
 
 	return ret;
@@ -562,7 +566,9 @@ int tb_domain_resume_noirq(struct tb *tb)
 	int ret = 0;
 
 	mutex_lock(&tb->lock);
+	lab_s2idle_trace_step("ctl.start.begin", tb->index, 0);
 	tb_ctl_start(tb->ctl);
+	lab_s2idle_trace_step("ctl.start.end", tb->index, 0);
 	if (tb->cm_ops->resume_noirq)
 		ret = tb->cm_ops->resume_noirq(tb);
 	mutex_unlock(&tb->lock);

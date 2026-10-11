@@ -188,6 +188,8 @@ static void apple_mbox_lab_rx_entry(struct apple_mbox *mbox)
 			lab_live.first_counter = counter;
 			lab_live.first_boot = boot;
 		}
+		if (!lab_live.rx)
+			lab_s2idle_trace_step("aop.rx.first", 0, 0);
 		lab_live.rx++;
 		lab_live.last_counter = counter;
 		lab_live.last_boot = boot;
@@ -224,8 +226,10 @@ static void apple_mbox_lab_wake(struct apple_mbox *mbox)
 		wake = true;
 	}
 	raw_spin_unlock_irqrestore(&lab_diag_lock, flags);
-	if (wake)
+	if (wake) {
+		lab_s2idle_trace_step("aop.deadline", 0, 0);
 		pm_system_wakeup();
+	}
 }
 
 static int apple_mbox_lab_suspend_noirq(struct device *dev)

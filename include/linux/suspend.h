@@ -257,6 +257,7 @@ extern void s2idle_set_ops(const struct platform_s2idle_ops *ops);
 extern void s2idle_wake(void);
 /* LAB ONLY: retained s2idle loop-exit diagnostic. */
 extern u64 lab_s2idle_exit_count(void);
+void lab_s2idle_trace_step(const char *stage, u64 device, int status);
 
 /**
  * arch_suspend_disable_irqs - disable IRQs for suspend
@@ -299,6 +300,7 @@ static inline void __init pm_states_init(void) {}
 static inline void s2idle_set_ops(const struct platform_s2idle_ops *ops) {}
 static inline void s2idle_wake(void) {}
 static inline u64 lab_s2idle_exit_count(void) { return 0; }
+static inline void lab_s2idle_trace_step(const char *stage, u64 device, int status) { }
 #endif /* !CONFIG_SUSPEND */
 
 static inline bool pm_suspend_in_progress(void)
