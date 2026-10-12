@@ -28,6 +28,9 @@ struct apple_crtc {
 
 	/* Reference to the DCP device owning this CRTC */
 	struct platform_device *dcp;
+
+	/* External scanout keeps the fabric up while the CRTC is active. */
+	bool fabric_held;
 };
 
 #define to_apple_crtc(x) container_of(x, struct apple_crtc, base)

@@ -40,6 +40,8 @@
 #include <drm/drm_vblank.h>
 #include <drm/drm_fixed.h>
 
+#include <linux/soc/apple/pmgr-misc.h>
+
 #include "dcp.h"
 #include "plane.h"
 
@@ -143,6 +145,12 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	}
 	if (crtc_state->active && !dcp_crtc_route_ready(crtc, state, true))
 		goto failed;
+	if (crtc_state->active && !dcp->main_display && !apple_crtc->fabric_held) {
+		/* Raise the fabric before external scanout starts. */
+		if (apple_pmgr_fabric_hold())
+			dev_warn(dcp->dev, "fabric raise not confirmed before scanout\n");
+		apple_crtc->fabric_held = true;
+	}
 	if (crtc_state->active &&
 	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
 		dcp_poweron(apple_crtc->dcp);
@@ -174,6 +182,10 @@ static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
 	if (crtc_state->active_changed && !crtc_state->active) {
 		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 		dcp_poweroff(apple_crtc->dcp);
+		if (apple_crtc->fabric_held) {
+			apple_crtc->fabric_held = false;
+			apple_pmgr_fabric_release();
+		}
 	}
 
 	if (crtc->state->event && !crtc->state->active) {
