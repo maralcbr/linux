@@ -7,16 +7,39 @@
 
 #include <linux/bitops.h>
 #include <linux/bitfield.h>
+#include <linux/cpufreq.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
+#include <linux/mfd/syscon.h>
+#include <linux/mutex.h>
+#include <linux/regmap.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/module.h>
+#include <linux/soc/apple/pmgr-misc.h>
+#include <linux/workqueue.h>
 
 #define APPLE_CLKGEN_PSTATE 0
 #define APPLE_CLKGEN_PSTATE_DESIRED GENMASK(3, 0)
+#define APPLE_CLKGEN_PSTATE_ACTUAL GENMASK(7, 4)
 
 #define SYS_DEV_PSTATE_SUSPEND 1
+
+#define APPLE_PMGR_IDLE_POLL_MS 250
+#define APPLE_PMGR_RAISE_TIMEOUT_US 1000
+#define APPLE_PMGR_PS_ACTUAL GENMASK(7, 4)
+#define APPLE_PMGR_PS_ACTIVE 0xf
+
+/*
+ * Bandwidth users that keep the fabric up whenever their power domain is
+ * active. External display and ANE system domains stay on even when idle,
+ * so external displays vote through apple_pmgr_fabric_hold() instead, and
+ * the ANE is not covered.
+ */
+static const char * const apple_pmgr_fabric_voters[] = {
+	"gfx", "avd_sys", "isp_sys",
+};
 
 enum sys_device {
 	DEV_FABRIC,
@@ -33,7 +56,23 @@ struct apple_pmgr_sys_device {
 struct apple_pmgr_misc {
 	struct device *dev;
 	struct apple_pmgr_sys_device devices[DEV_MAX];
+
+	/* Idle fabric governor; lock serializes fabric writes while awake. */
+	struct mutex lock;
+	struct delayed_work idle_work;		/* deferrable: fabric high */
+	struct delayed_work idle_work_prompt;	/* bounded raise: fabric low */
+	u32 fabric_now;				/* protected by lock */
+	unsigned int holds;			/* protected by lock */
+	bool sleeping;				/* protected by lock */
+	bool voters_ok;
+	struct {
+		struct regmap *regmap;
+		u32 reg;
+	} votes[ARRAY_SIZE(apple_pmgr_fabric_voters)];
 };
+
+static struct apple_pmgr_misc *apple_pmgr_misc_inst;
+static unsigned int idle_fabric_pstate;
 
 static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
 					  enum sys_device dev, bool active)
@@ -57,6 +96,250 @@ static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
 	writel_relaxed(val, misc->devices[dev].base);
 }
 
+static void apple_pmgr_write_fabric(struct apple_pmgr_misc *misc, u32 pstate)
+{
+	void __iomem *reg = misc->devices[DEV_FABRIC].base + APPLE_CLKGEN_PSTATE;
+	u32 val;
+
+	lockdep_assert_held(&misc->lock);
+	val = readl_relaxed(reg);
+	val &= ~APPLE_CLKGEN_PSTATE_DESIRED;
+	val |= FIELD_PREP(APPLE_CLKGEN_PSTATE_DESIRED, pstate);
+	writel_relaxed(val, reg);
+	misc->fabric_now = pstate;
+}
+
+/* Raise to the boot p-state and wait until the hardware reports it. */
+static int apple_pmgr_raise_fabric(struct apple_pmgr_misc *misc)
+{
+	u32 active = misc->devices[DEV_FABRIC].active_state;
+	u32 val;
+	int ret;
+
+	lockdep_assert_held(&misc->lock);
+	if (misc->fabric_now == active)
+		return 0;
+	apple_pmgr_write_fabric(misc, active);
+	ret = readl_poll_timeout(misc->devices[DEV_FABRIC].base + APPLE_CLKGEN_PSTATE,
+				 val, FIELD_GET(APPLE_CLKGEN_PSTATE_ACTUAL, val) == active,
+				 10, APPLE_PMGR_RAISE_TIMEOUT_US);
+	/* Not confirmed: make the next caller try again. */
+	if (ret)
+		misc->fabric_now = U32_MAX;
+	return ret;
+}
+
+/**
+ * apple_pmgr_fabric_hold() - keep the fabric at its boot p-state
+ *
+ * For bandwidth users the idle governor cannot see, such as an external
+ * display. Returns once the fabric is confirmed up, or an error if it did
+ * not get there in time; the hold stands either way and must be released.
+ */
+int apple_pmgr_fabric_hold(void)
+{
+	struct apple_pmgr_misc *misc = READ_ONCE(apple_pmgr_misc_inst);
+
+	if (!misc)
+		return 0;
+	guard(mutex)(&misc->lock);
+	misc->holds++;
+	return apple_pmgr_raise_fabric(misc);
+}
+EXPORT_SYMBOL_GPL(apple_pmgr_fabric_hold);
+
+void apple_pmgr_fabric_release(void)
+{
+	struct apple_pmgr_misc *misc = READ_ONCE(apple_pmgr_misc_inst);
+
+	if (!misc)
+		return;
+	guard(mutex)(&misc->lock);
+	if (!WARN_ON_ONCE(!misc->holds))
+		misc->holds--;
+}
+EXPORT_SYMBOL_GPL(apple_pmgr_fabric_release);
+
+static bool apple_pmgr_voters_active(struct apple_pmgr_misc *misc)
+{
+	unsigned int i;
+	u32 val;
+
+	for (i = 0; i < ARRAY_SIZE(misc->votes); i++) {
+		/*
+		 * Only the actual state shows activity: the GPU domain keeps its
+		 * target on with auto power gating and the hardware gates it
+		 * when idle. Unreadable counts as busy.
+		 */
+		if (regmap_read(misc->votes[i].regmap, misc->votes[i].reg, &val) ||
+		    FIELD_GET(APPLE_PMGR_PS_ACTUAL, val) == APPLE_PMGR_PS_ACTIVE)
+			return true;
+	}
+	return false;
+}
+
+/* Every expected voter must be found, or the governor never lowers. */
+static void apple_pmgr_find_voters(struct apple_pmgr_misc *misc)
+{
+	unsigned int found = 0, i;
+	struct device_node *np;
+	const char *label;
+	u32 reg;
+
+	for_each_compatible_node(np, NULL, "apple,pmgr-pwrstate") {
+		if (!of_device_is_available(np) ||
+		    of_property_read_string(np, "label", &label) ||
+		    of_property_read_u32(np, "reg", &reg))
+			continue;
+		for (i = 0; i < ARRAY_SIZE(apple_pmgr_fabric_voters); i++) {
+			struct regmap *map;
+
+			if (strcmp(label, apple_pmgr_fabric_voters[i]) ||
+			    misc->votes[i].regmap)
+				continue;
+			map = syscon_node_to_regmap(np->parent);
+			if (IS_ERR(map))
+				break;
+			misc->votes[i].regmap = map;
+			misc->votes[i].reg = reg;
+			found++;
+			break;
+		}
+	}
+	misc->voters_ok = found == ARRAY_SIZE(apple_pmgr_fabric_voters);
+	if (!misc->voters_ok)
+		dev_warn(misc->dev, "idle fabric: found %u of %zu bandwidth voters, staying high\n",
+			 found, ARRAY_SIZE(apple_pmgr_fabric_voters));
+}
+
+/* True while every cpufreq policy runs at its lowest frequency. */
+static bool apple_pmgr_cpus_at_min(void)
+{
+	struct cpufreq_policy *policy;
+	unsigned int cpu;
+	bool at_min = true;
+
+	for_each_online_cpu(cpu) {
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			return false;
+		if (READ_ONCE(policy->cur) > policy->cpuinfo.min_freq)
+			at_min = false;
+		cpufreq_cpu_put(policy);
+		if (!at_min)
+			break;
+	}
+	return at_min;
+}
+
+static void apple_pmgr_idle_eval(struct apple_pmgr_misc *misc)
+{
+	unsigned int idle = READ_ONCE(idle_fabric_pstate);
+	u32 active = misc->devices[DEV_FABRIC].active_state;
+	bool low = false;
+
+	scoped_guard(mutex, &misc->lock) {
+		if (misc->sleeping)
+			return;
+		low = idle && idle < active && misc->voters_ok && !misc->holds &&
+		      !apple_pmgr_voters_active(misc) && apple_pmgr_cpus_at_min();
+		if (low && misc->fabric_now != idle)
+			apple_pmgr_write_fabric(misc, idle);
+		else if (!low)
+			apple_pmgr_raise_fabric(misc);
+		if (!idle)
+			return;
+	}
+
+	/*
+	 * Freezable, so it stops before devices suspend. While the fabric is
+	 * high a deferrable timer never wakes an idle CPU; while it is low a
+	 * normal timer limits how long new load runs at reduced bandwidth.
+	 */
+	queue_delayed_work(system_freezable_power_efficient_wq,
+			   low ? &misc->idle_work_prompt : &misc->idle_work,
+			   msecs_to_jiffies(APPLE_PMGR_IDLE_POLL_MS));
+}
+
+static void apple_pmgr_idle_work(struct work_struct *work)
+{
+	apple_pmgr_idle_eval(container_of(to_delayed_work(work),
+					  struct apple_pmgr_misc, idle_work));
+}
+
+static void apple_pmgr_idle_work_prompt(struct work_struct *work)
+{
+	apple_pmgr_idle_eval(container_of(to_delayed_work(work),
+					  struct apple_pmgr_misc, idle_work_prompt));
+}
+
+static void apple_pmgr_idle_stop(struct apple_pmgr_misc *misc)
+{
+	cancel_delayed_work_sync(&misc->idle_work);
+	cancel_delayed_work_sync(&misc->idle_work_prompt);
+	guard(mutex)(&misc->lock);
+	apple_pmgr_raise_fabric(misc);
+}
+
+static int idle_fabric_pstate_set(const char *val, const struct kernel_param *kp)
+{
+	struct apple_pmgr_misc *misc = READ_ONCE(apple_pmgr_misc_inst);
+	unsigned int ps;
+	int ret;
+
+	ret = kstrtouint(val, 0, &ps);
+	if (ret)
+		return ret;
+	if (ps > FIELD_MAX(APPLE_CLKGEN_PSTATE_DESIRED))
+		return -EINVAL;
+	WRITE_ONCE(idle_fabric_pstate, ps);
+	if (!misc)
+		return 0;
+	if (!ps)
+		apple_pmgr_idle_stop(misc);
+	else
+		mod_delayed_work(system_freezable_power_efficient_wq, &misc->idle_work, 0);
+	return 0;
+}
+
+static const struct kernel_param_ops idle_fabric_pstate_ops = {
+	.set = idle_fabric_pstate_set,
+	.get = param_get_uint,
+};
+
+/*
+ * Boot leaves the fabric at its high p-state and nothing lowers it while the
+ * system is awake; on t6000 a fabric p-state of 1 saves about 0.5 W at idle.
+ */
+module_param_cb(idle_fabric_pstate, &idle_fabric_pstate_ops, &idle_fabric_pstate, 0644);
+MODULE_PARM_DESC(idle_fabric_pstate,
+		 "Fabric p-state while all CPUs run at their lowest frequency and no bandwidth user is active (0 = keep the boot state)");
+
+/* Raise before any device suspends; noirq then applies the suspend p-state. */
+static int __maybe_unused apple_pmgr_misc_prepare(struct device *dev)
+{
+	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
+
+	if (!misc->devices[DEV_FABRIC].base)
+		return 0;
+	scoped_guard(mutex, &misc->lock)
+		misc->sleeping = true;
+	apple_pmgr_idle_stop(misc);
+	return 0;
+}
+
+static void __maybe_unused apple_pmgr_misc_complete(struct device *dev)
+{
+	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
+
+	if (!misc->devices[DEV_FABRIC].base)
+		return;
+	scoped_guard(mutex, &misc->lock)
+		misc->sleeping = false;
+	if (READ_ONCE(idle_fabric_pstate))
+		mod_delayed_work(system_freezable_power_efficient_wq, &misc->idle_work, 0);
+}
+
 static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
 {
 	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
@@ -73,6 +356,7 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
 	int i;
 
+	misc->fabric_now = misc->devices[DEV_FABRIC].active_state;
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, true);
 
@@ -127,6 +411,18 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, misc);
 
+	if (misc->devices[DEV_FABRIC].base) {
+		mutex_init(&misc->lock);
+		misc->fabric_now = misc->devices[DEV_FABRIC].active_state;
+		INIT_DEFERRABLE_WORK(&misc->idle_work, apple_pmgr_idle_work);
+		INIT_DELAYED_WORK(&misc->idle_work_prompt, apple_pmgr_idle_work_prompt);
+		apple_pmgr_find_voters(misc);
+		WRITE_ONCE(apple_pmgr_misc_inst, misc);
+		if (READ_ONCE(idle_fabric_pstate))
+			queue_delayed_work(system_freezable_power_efficient_wq,
+					   &misc->idle_work, 0);
+	}
+
 	return ret;
 }
 
@@ -138,6 +434,8 @@ static const struct of_device_id apple_pmgr_misc_of_match[] = {
 MODULE_DEVICE_TABLE(of, apple_pmgr_misc_of_match);
 
 static const struct dev_pm_ops apple_pmgr_misc_pm_ops = {
+	.prepare = apple_pmgr_misc_prepare,
+	.complete = apple_pmgr_misc_complete,
 	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_pmgr_misc_suspend_noirq,
 				      apple_pmgr_misc_resume_noirq)
 };
@@ -147,6 +445,8 @@ static struct platform_driver apple_pmgr_misc_driver = {
 	.driver = {
 		.name = "apple-pmgr-misc",
 		.of_match_table = apple_pmgr_misc_of_match,
+		/* The governor's workers and holders outlive any unbind. */
+		.suppress_bind_attrs = true,
 		.pm = pm_ptr(&apple_pmgr_misc_pm_ops),
 	},
 };
