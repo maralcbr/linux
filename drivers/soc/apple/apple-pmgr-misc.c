@@ -165,15 +165,19 @@ static int apple_pmgr_raise_fabric(struct apple_pmgr_misc *misc)
 {
 	u32 active = misc->devices[DEV_FABRIC].active_state;
 	u32 val;
+	int ret;
 
 	lockdep_assert_held(&misc->lock);
 	/* PMP firmware owns the fabric; holds delegate to it. */
 	if (misc->pmp_owned || misc->fabric_now == active)
 		return 0;
 	apple_pmgr_write_fabric(misc, active);
-	return readl_poll_timeout(misc->devices[DEV_FABRIC].base + APPLE_CLKGEN_PSTATE,
-				  val, FIELD_GET(APPLE_CLKGEN_PSTATE_ACTUAL, val) == active,
-				  10, APPLE_PMGR_RAISE_TIMEOUT_US);
+	ret = readl_poll_timeout(misc->devices[DEV_FABRIC].base + APPLE_CLKGEN_PSTATE,
+				 val, FIELD_GET(APPLE_CLKGEN_PSTATE_ACTUAL, val) == active,
+				 10, APPLE_PMGR_RAISE_TIMEOUT_US);
+	if (ret)
+		misc->fabric_now = U32_MAX;
+	return ret;
 }
 
 /**
@@ -443,9 +447,12 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 			void __iomem *reg = misc->devices[DEV_FABRIC].base + APPLE_CLKGEN_PSTATE;
 			u32 val = readl_relaxed(reg);
 
-			val &= ~APPLE_CLKGEN_PSTATE_DESIRED;
-			val |= FIELD_PREP(APPLE_CLKGEN_PSTATE_DESIRED, misc->pmp_fabric);
-			writel_relaxed(val, reg);
+			if (FIELD_GET(APPLE_CLKGEN_PSTATE_DESIRED, val) ==
+			    misc->devices[DEV_FABRIC].suspend_state) {
+				val &= ~APPLE_CLKGEN_PSTATE_DESIRED;
+				val |= FIELD_PREP(APPLE_CLKGEN_PSTATE_DESIRED, misc->pmp_fabric);
+				writel_relaxed(val, reg);
+			}
 		}
 		return 0;
 	}
@@ -524,9 +531,13 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 		INIT_DELAYED_WORK(&misc->idle_work_prompt, apple_pmgr_idle_work_prompt);
 		apple_pmgr_find_voters(misc);
 		WRITE_ONCE(apple_pmgr_misc_inst, misc);
-		if (READ_ONCE(idle_fabric_pstate))
+		if (READ_ONCE(idle_fabric_pstate) && misc->pmp_owned) {
+			dev_warn(dev, "idle fabric governor disabled: PMP manages the fabric\n");
+			WRITE_ONCE(idle_fabric_pstate, 0);
+		} else if (READ_ONCE(idle_fabric_pstate)) {
 			queue_delayed_work(system_freezable_power_efficient_wq,
 					   &misc->idle_work, 0);
+		}
 	}
 
 	return ret;
