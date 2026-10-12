@@ -65,6 +65,8 @@ struct apple_pmgr_misc {
 	unsigned int holds;			/* protected by lock */
 	bool sleeping;				/* protected by lock */
 	bool voters_ok;
+	bool pmp_owned; /* PMP firmware manages fabric and DCS p-states */
+	u32 pmp_fabric; /* PMP's desired fabric p-state, saved across suspend */
 	struct {
 		struct regmap *regmap;
 		u32 reg;
@@ -117,7 +119,8 @@ static int apple_pmgr_raise_fabric(struct apple_pmgr_misc *misc)
 	int ret;
 
 	lockdep_assert_held(&misc->lock);
-	if (misc->fabric_now == active)
+	/* PMP firmware owns the fabric; holds delegate to it. */
+	if (misc->pmp_owned || misc->fabric_now == active)
 		return 0;
 	apple_pmgr_write_fabric(misc, active);
 	ret = readl_poll_timeout(misc->devices[DEV_FABRIC].base + APPLE_CLKGEN_PSTATE,
@@ -135,6 +138,8 @@ static int apple_pmgr_raise_fabric(struct apple_pmgr_misc *misc)
  * For bandwidth users the idle governor cannot see, such as an external
  * display. Returns once the fabric is confirmed up, or an error if it did
  * not get there in time; the hold stands either way and must be released.
+ * With PMP owning the fabric no vote is sent: the firmware decides, and
+ * this returns success.
  */
 int apple_pmgr_fabric_hold(void)
 {
@@ -241,8 +246,9 @@ static void apple_pmgr_idle_eval(struct apple_pmgr_misc *misc)
 	scoped_guard(mutex, &misc->lock) {
 		if (misc->sleeping)
 			return;
-		low = idle && idle < active && misc->voters_ok && !misc->holds &&
-		      !apple_pmgr_voters_active(misc) && apple_pmgr_cpus_at_min();
+		low = idle && idle < active && misc->voters_ok && !misc->pmp_owned &&
+		      !misc->holds && !apple_pmgr_voters_active(misc) &&
+		      apple_pmgr_cpus_at_min();
 		if (low && misc->fabric_now != idle)
 			apple_pmgr_write_fabric(misc, idle);
 		else if (!low)
@@ -292,6 +298,8 @@ static int idle_fabric_pstate_set(const char *val, const struct kernel_param *kp
 		return ret;
 	if (ps > FIELD_MAX(APPLE_CLKGEN_PSTATE_DESIRED))
 		return -EINVAL;
+	if (ps && misc && misc->pmp_owned)
+		return -EBUSY;
 	WRITE_ONCE(idle_fabric_pstate, ps);
 	if (!misc)
 		return 0;
@@ -345,6 +353,21 @@ static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
 	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
 	int i;
 
+	if (misc->pmp_owned) {
+		/*
+		 * Lowering DCS under PMP leaves s2idle unable to resume; the
+		 * fabric alone is safe and saves ~0.35 W in s2idle on t6000.
+		 * Keep PMP's choice to hand back on resume.
+		 */
+		void __iomem *base = misc->devices[DEV_FABRIC].base;
+
+		if (base) {
+			misc->pmp_fabric = FIELD_GET(APPLE_CLKGEN_PSTATE_DESIRED,
+						     readl_relaxed(base + APPLE_CLKGEN_PSTATE));
+			apple_pmgr_sys_dev_set_pstate(misc, DEV_FABRIC, false);
+		}
+		return 0;
+	}
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, false);
 
@@ -357,6 +380,21 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 	int i;
 
 	misc->fabric_now = misc->devices[DEV_FABRIC].active_state;
+	if (misc->pmp_owned) {
+		if (misc->devices[DEV_FABRIC].base) {
+			void __iomem *reg = misc->devices[DEV_FABRIC].base + APPLE_CLKGEN_PSTATE;
+			u32 val = readl_relaxed(reg);
+
+			/* PMP keeps running: never overwrite a choice it made since. */
+			if (FIELD_GET(APPLE_CLKGEN_PSTATE_DESIRED, val) ==
+			    misc->devices[DEV_FABRIC].suspend_state) {
+				val &= ~APPLE_CLKGEN_PSTATE_DESIRED;
+				val |= FIELD_PREP(APPLE_CLKGEN_PSTATE_DESIRED, misc->pmp_fabric);
+				writel_relaxed(val, reg);
+			}
+		}
+		return 0;
+	}
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, true);
 
@@ -395,6 +433,7 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct apple_pmgr_misc *misc;
+	struct device_node *np;
 	int ret = -ENODEV;
 
 	misc = devm_kzalloc(dev, sizeof(*misc), GFP_KERNEL);
@@ -411,6 +450,17 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, misc);
 
+	/*
+	 * With PMP enabled its firmware owns the fabric and DCS p-states.
+	 * Writing them for suspend as well leaves the system unable to resume
+	 * from s2idle on t6000, and the idle governor would fight PMP.
+	 */
+	np = of_find_compatible_node(NULL, NULL, "apple,t6000-pmp-v2");
+	misc->pmp_owned = np && of_device_is_available(np);
+	of_node_put(np);
+	if (misc->pmp_owned)
+		dev_info(dev, "PMP manages fabric and DCS p-states\n");
+
 	if (misc->devices[DEV_FABRIC].base) {
 		mutex_init(&misc->lock);
 		misc->fabric_now = misc->devices[DEV_FABRIC].active_state;
@@ -418,9 +468,13 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 		INIT_DELAYED_WORK(&misc->idle_work_prompt, apple_pmgr_idle_work_prompt);
 		apple_pmgr_find_voters(misc);
 		WRITE_ONCE(apple_pmgr_misc_inst, misc);
-		if (READ_ONCE(idle_fabric_pstate))
+		if (READ_ONCE(idle_fabric_pstate) && misc->pmp_owned) {
+			dev_warn(dev, "idle fabric governor disabled: PMP manages the fabric\n");
+			WRITE_ONCE(idle_fabric_pstate, 0);
+		} else if (READ_ONCE(idle_fabric_pstate)) {
 			queue_delayed_work(system_freezable_power_efficient_wq,
 					   &misc->idle_work, 0);
+		}
 	}
 
 	return ret;
