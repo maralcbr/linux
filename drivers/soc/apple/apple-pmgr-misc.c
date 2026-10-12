@@ -12,6 +12,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/module.h>
+#include <linux/sysfs.h>
 
 #define APPLE_CLKGEN_PSTATE 0
 #define APPLE_CLKGEN_PSTATE_DESIRED GENMASK(3, 0)
@@ -60,6 +61,44 @@ static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
 /* LAB ONLY: skip the fabric/DCS suspend requests, to test their interaction with PMP. */
 static bool lab_skip_suspend;
 module_param(lab_skip_suspend, bool, 0644);
+
+/* LAB ONLY: set the awake fabric/DCS desired p-state at runtime ("fabric N" / "dcs N"). */
+static struct apple_pmgr_misc *lab_misc;
+
+static int lab_pstate_set(const char *val, const struct kernel_param *kp)
+{
+	char which[8];
+	unsigned int ps;
+	int dev;
+	u32 v;
+
+	if (!lab_misc || sscanf(val, "%7s %u", which, &ps) != 2 || ps > 15)
+		return -EINVAL;
+	dev = !strcmp(which, "dcs");
+	if (!lab_misc->devices[dev].base)
+		return -ENODEV;
+	v = readl_relaxed(lab_misc->devices[dev].base + APPLE_CLKGEN_PSTATE);
+	writel_relaxed((v & ~APPLE_CLKGEN_PSTATE_DESIRED) |
+		       FIELD_PREP(APPLE_CLKGEN_PSTATE_DESIRED, ps),
+		       lab_misc->devices[dev].base + APPLE_CLKGEN_PSTATE);
+	pr_info("pmgr-misc lab: %s %08x -> desired %u\n", which, v, ps);
+	return 0;
+}
+
+static int lab_pstate_get(char *buf, const struct kernel_param *kp)
+{
+	if (!lab_misc)
+		return sysfs_emit(buf, "none\n");
+	return sysfs_emit(buf, "fabric=%08x dcs=%08x\n",
+			  lab_misc->devices[0].base ? readl_relaxed(lab_misc->devices[0].base) : 0,
+			  lab_misc->devices[1].base ? readl_relaxed(lab_misc->devices[1].base) : 0);
+}
+
+static const struct kernel_param_ops lab_pstate_ops = {
+	.set = lab_pstate_set,
+	.get = lab_pstate_get,
+};
+module_param_cb(lab_pstate, &lab_pstate_ops, NULL, 0644);
 
 static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
 {
@@ -136,6 +175,7 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 		ret = 0;
 
 	platform_set_drvdata(pdev, misc);
+	lab_misc = misc;
 
 	return ret;
 }
