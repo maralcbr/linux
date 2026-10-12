@@ -60,6 +60,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/string.h>
+#include <linux/suspend.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_graph.h>
@@ -147,6 +148,7 @@ static const struct apple_cio_hw apple_cio_t6030_hw = {
 /* Observation only: no extra control requests or downstream enumeration. */
 #define APPLE_CIO_RESUME_LINK_WAIT_MS 90000
 #define APPLE_CIO_RESUME_LINK_CHECK_MS 5000
+#define APPLE_CIO_SLEEP_RESTART_FALLBACK_MS 10000
 
 static bool resume_recovery;
 module_param(resume_recovery, bool, 0644);
@@ -154,6 +156,16 @@ MODULE_PARM_DESC(resume_recovery,
 		 "Recover missing post-resume discovery once per driver load (default N)");
 /* Shared by all ACIO ports; never refilled by suspend or cable changes. */
 static atomic_t resume_recovery_used = ATOMIC_INIT(0);
+
+/*
+ * A connected port keeps its link trained through s2idle, which costs about
+ * 1.3 W on t6000. Powering ACIO off for the sleep saves that, but drops every
+ * tunnel: devices behind them are removed and rediscovered after resume.
+ */
+static bool s2idle_teardown;
+module_param(s2idle_teardown, bool, 0644);
+MODULE_PARM_DESC(s2idle_teardown,
+		 "Power off connected ports for system sleep and restart them on resume (default N; drops tunnels)");
 
 #define APPLE_CIO_START_RETRIES 5
 #define APPLE_CIO_START_RETRY_DELAY_MS 100
@@ -213,6 +225,15 @@ struct apple_cio {
 	bool resume_recovery_failed; /* terminal recovery failure */
 	bool resume_link_failed; /* protected by lock */
 	bool resume_link_pending; /* set by NHI resume, consumed by ACIO complete */
+	struct notifier_block pm_notifier;
+	struct delayed_work sleep_restart_work;
+	enum {
+		APPLE_CIO_SLEEP_OPEN,		/* cable changes apply normally */
+		APPLE_CIO_SLEEP_CLOSED,		/* torn down for sleep: changes recorded only */
+		APPLE_CIO_SLEEP_RESUMED,	/* next cable state is a post-resume snapshot */
+	} sleep_phase; /* protected by lock */
+	bool sleep_restart_owed; /* protected by lock */
+	bool sleep_aborted_early; /* protected by lock: devices never suspended */
 
 	u32 current_cable_info;
 	u32 target_cable_info;
@@ -2679,6 +2700,8 @@ static void apple_cio_complete(struct device *dev)
 	struct apple_cio *acio = dev_get_drvdata(dev);
 
 	guard(mutex)(&acio->lock);
+	if (acio->sleep_phase == APPLE_CIO_SLEEP_CLOSED)
+		acio->sleep_phase = APPLE_CIO_SLEEP_RESUMED;
 	if (!READ_ONCE(acio->resume_link_pending))
 		return;
 	WRITE_ONCE(acio->resume_link_pending, false);
@@ -2748,6 +2771,19 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 		break;
 	}
 
+	/* Until resume, record changes; CD321x reapplies fresh state afterwards. */
+	if (acio->sleep_phase == APPLE_CIO_SLEEP_CLOSED)
+		return 0;
+	if (acio->sleep_phase == APPLE_CIO_SLEEP_RESUMED)
+		acio->sleep_phase = APPLE_CIO_SLEEP_OPEN;
+	/*
+	 * Only a successful start settles a restart owed from sleep: CD321x
+	 * also sends OFF as an intermediate step of a reconnect. With the cable
+	 * truly gone, the cost is one extra cable read per later sleep.
+	 */
+	if (acio->sleep_restart_owed && acio->target_cable_info)
+		dev_info(acio->dev, "restarting port after system sleep\n");
+
 	if (acio->target_cable_info == acio->current_cable_info)
 		return acio->current_cable_info ? apple_cio_check_connection(acio) : 0;
 
@@ -2774,6 +2810,8 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 		if (acio->resume_recovery_failed)
 			return -ESHUTDOWN;
 		ret = apple_cio_start(acio);
+		if (!ret)
+			acio->sleep_restart_owed = false;
 		if (ret && acio->resume_recovery_active) {
 			acio->resume_recovery_failed = true;
 			acio->target_cable_info = 0;
@@ -2787,6 +2825,104 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 
 	apple_cio_stop(acio);
 	return 0;
+}
+
+static void apple_cio_sleep_teardown(struct apple_cio *acio)
+{
+	cancel_delayed_work_sync(&acio->resume_link_work);
+
+	guard(mutex)(&acio->lock);
+	if (acio->removing || acio->resume_recovery_failed || !acio->current_cable_info)
+		return;
+
+	/*
+	 * PCIe endpoints may unregister PM notifiers on removal, which would
+	 * deadlock inside this notifier chain, and storage must not disappear
+	 * under running applications. Skip ports with PCIe tunnels, and close
+	 * PCIe admission in the same critical section; the next NHI probe
+	 * reopens it.
+	 */
+	scoped_guard(mutex, &acio->pcie_tunnel_lock) {
+		if (READ_ONCE(acio->pcie_tunnel_requested) || acio->pcie_tunnel_populated)
+			return;
+		acio->pcie_tunnel_stopping = true;
+	}
+
+	dev_info(acio->dev, "powering off port for system sleep (cable info 0x%x)\n",
+		 acio->current_cable_info);
+	apple_cio_stop(acio);
+	acio->sleep_phase = APPLE_CIO_SLEEP_CLOSED;
+	acio->sleep_restart_owed = true;
+}
+
+/* A restart still owed from the last sleep must not race this suspend. */
+static void apple_cio_sleep_close_owed(struct apple_cio *acio)
+{
+	guard(mutex)(&acio->lock);
+	if (acio->sleep_restart_owed && !acio->current_cable_info)
+		acio->sleep_phase = APPLE_CIO_SLEEP_CLOSED;
+	acio->sleep_aborted_early = false;
+}
+
+/*
+ * Runs when no post-resume revalidation has restarted the port: always
+ * after an aborted suspend, and as a fallback after a real one. Ask CD321x
+ * for a fresh read instead of starting from the state recorded before sleep.
+ */
+static void apple_cio_sleep_restart_work(struct work_struct *work)
+{
+	struct apple_cio *acio = container_of(to_delayed_work(work), struct apple_cio,
+					      sleep_restart_work);
+
+	scoped_guard(mutex, &acio->lock) {
+		acio->sleep_aborted_early = false;
+		if (!acio->sleep_restart_owed)
+			return;
+		acio->sleep_phase = APPLE_CIO_SLEEP_OPEN;
+		if (acio->removing || acio->resume_recovery_failed || acio->current_cable_info) {
+			acio->sleep_restart_owed = false;
+			return;
+		}
+		dev_info(acio->dev, "requesting cable restore after system sleep\n");
+	}
+
+	/* Never notify under acio->lock: CD321x calls back into .set. */
+	typec_thunderbolt_switch_notify_restore(acio->tbt_switch);
+}
+
+static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
+			       void *unused)
+{
+	struct apple_cio *acio = container_of(nb, struct apple_cio, pm_notifier);
+	bool owed, early;
+
+	switch (event) {
+	case PM_SUSPEND_PREPARE:
+		/* Nothing from an earlier sleep may restart the port during this one. */
+		cancel_delayed_work_sync(&acio->sleep_restart_work);
+		apple_cio_sleep_close_owed(acio);
+		/* Before tasks freeze: tearing down the NHI needs unfrozen work. */
+		if (READ_ONCE(s2idle_teardown))
+			apple_cio_sleep_teardown(acio);
+		break;
+	case PM_POST_SUSPEND:
+		scoped_guard(mutex, &acio->lock) {
+			/* Aborted before device suspend: complete never ran. */
+			if (acio->sleep_phase == APPLE_CIO_SLEEP_CLOSED) {
+				acio->sleep_phase = APPLE_CIO_SLEEP_RESUMED;
+				acio->sleep_aborted_early = true;
+			}
+			owed = acio->sleep_restart_owed;
+			early = acio->sleep_aborted_early;
+		}
+		/* Start from a worker: probing children inside this chain can deadlock. */
+		if (owed)
+			queue_delayed_work(system_unbound_wq, &acio->sleep_restart_work,
+					   early ? 0 :
+					   msecs_to_jiffies(APPLE_CIO_SLEEP_RESTART_FALLBACK_MS));
+		break;
+	}
+	return NOTIFY_DONE;
 }
 
 static int apple_cio_pcie_notify(struct notifier_block *nb,
@@ -2821,6 +2957,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&acio->pcie_tunnel_work,
 			  apple_cio_pcie_tunnel_work);
 	INIT_DELAYED_WORK(&acio->resume_link_work, apple_cio_resume_link_work);
+	INIT_DELAYED_WORK(&acio->sleep_restart_work, apple_cio_sleep_restart_work);
 	init_completion(&acio->nhi_boot_completion);
 	acio->dev = &pdev->dev;
 	acio->np = dev->of_node;
@@ -2985,6 +3122,8 @@ static int apple_cio_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	acio->pm_notifier.notifier_call = apple_cio_pm_notify;
+	register_pm_notifier(&acio->pm_notifier);
 	return 0;
 }
 
@@ -2997,6 +3136,8 @@ static void apple_cio_remove(struct platform_device *pdev)
 		acio->removing = true;
 
 	apple_pcie_tunnel_unregister_notifier(&acio->pcie_notifier);
+	unregister_pm_notifier(&acio->pm_notifier);
+	disable_delayed_work_sync(&acio->sleep_restart_work);
 
 	disable_delayed_work_sync(&acio->resume_link_work);
 	/* The worker can notify this switch; stop current and future enqueues. */
