@@ -80,6 +80,10 @@ static unsigned int idle_fabric_pstate;
 static bool lab_skip_suspend;
 module_param(lab_skip_suspend, bool, 0644);
 
+/* LAB ONLY: with PMP, still write these suspend p-states (bit 0 fabric, bit 1 DCS). */
+static unsigned int lab_pmp_writes;
+module_param(lab_pmp_writes, uint, 0644);
+
 /* LAB ONLY: read the fabric/DCS registers, or force a desired p-state ("fabric N" / "dcs N"). */
 static int lab_pstate_set(const char *val, const struct kernel_param *kp)
 {
@@ -394,8 +398,16 @@ static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
 		dev_info(dev, "lab: skipping fabric/DCS suspend p-states\n");
 		return 0;
 	}
-	if (misc->pmp_owned)
+	if (misc->pmp_owned) {
+		unsigned int w = READ_ONCE(lab_pmp_writes);
+
+		for (i = 0; i < DEV_MAX; i++)
+			if (w & BIT(i)) {
+				dev_info(dev, "lab: PMP, still writing suspend p-state for %d\n", i);
+				apple_pmgr_sys_dev_set_pstate(misc, i, false);
+			}
 		return 0;
+	}
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, false);
 
@@ -408,7 +420,15 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 	int i;
 
 	misc->fabric_now = misc->devices[DEV_FABRIC].active_state;
-	if (READ_ONCE(lab_skip_suspend) || misc->pmp_owned)
+	if (misc->pmp_owned) {
+		unsigned int w = READ_ONCE(lab_pmp_writes);
+
+		for (i = 0; i < DEV_MAX; i++)
+			if (w & BIT(i))
+				apple_pmgr_sys_dev_set_pstate(misc, i, true);
+		return 0;
+	}
+	if (READ_ONCE(lab_skip_suspend))
 		return 0;
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, true);
