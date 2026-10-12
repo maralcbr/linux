@@ -67,6 +67,7 @@ struct apple_pmgr_misc {
 	bool sleeping;				/* protected by lock */
 	bool voters_ok;
 	bool pmp_owned; /* PMP firmware manages fabric and DCS p-states */
+	u32 pmp_fabric; /* PMP's desired fabric p-state, saved across suspend */
 	struct {
 		struct regmap *regmap;
 		u32 reg;
@@ -400,12 +401,21 @@ static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
 	}
 	if (misc->pmp_owned) {
 		unsigned int w = READ_ONCE(lab_pmp_writes);
+		void __iomem *base = misc->devices[DEV_FABRIC].base;
 
-		for (i = 0; i < DEV_MAX; i++)
-			if (w & BIT(i)) {
-				dev_info(dev, "lab: PMP, still writing suspend p-state for %d\n", i);
-				apple_pmgr_sys_dev_set_pstate(misc, i, false);
-			}
+		if (w) {
+			for (i = 0; i < DEV_MAX; i++)
+				if (w & BIT(i)) {
+					dev_info(dev, "lab: PMP, still writing suspend p-state for %d\n", i);
+					apple_pmgr_sys_dev_set_pstate(misc, i, false);
+				}
+			return 0;
+		}
+		if (base) {
+			misc->pmp_fabric = FIELD_GET(APPLE_CLKGEN_PSTATE_DESIRED,
+						     readl_relaxed(base + APPLE_CLKGEN_PSTATE));
+			apple_pmgr_sys_dev_set_pstate(misc, DEV_FABRIC, false);
+		}
 		return 0;
 	}
 	for (i = 0; i < DEV_MAX; i++)
@@ -423,9 +433,20 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 	if (misc->pmp_owned) {
 		unsigned int w = READ_ONCE(lab_pmp_writes);
 
-		for (i = 0; i < DEV_MAX; i++)
-			if (w & BIT(i))
-				apple_pmgr_sys_dev_set_pstate(misc, i, true);
+		if (w) {
+			for (i = 0; i < DEV_MAX; i++)
+				if (w & BIT(i))
+					apple_pmgr_sys_dev_set_pstate(misc, i, true);
+			return 0;
+		}
+		if (misc->devices[DEV_FABRIC].base) {
+			void __iomem *reg = misc->devices[DEV_FABRIC].base + APPLE_CLKGEN_PSTATE;
+			u32 val = readl_relaxed(reg);
+
+			val &= ~APPLE_CLKGEN_PSTATE_DESIRED;
+			val |= FIELD_PREP(APPLE_CLKGEN_PSTATE_DESIRED, misc->pmp_fabric);
+			writel_relaxed(val, reg);
+		}
 		return 0;
 	}
 	if (READ_ONCE(lab_skip_suspend))
