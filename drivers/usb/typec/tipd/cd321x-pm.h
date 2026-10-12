@@ -109,9 +109,24 @@ static inline bool cd321x_pm_activation_ready(struct cd321x_pm_state *pm)
 	return true;
 }
 
+static inline bool cd321x_pm_restore(struct cd321x_pm_state *pm)
+{
+	/* A prepared port revalidates on its own resume. */
+	if (pm->phase == CD321X_PM_INITIALIZING ||
+	    pm->phase == CD321X_PM_PREPARED || pm->phase == CD321X_PM_REMOVED)
+		return false;
+
+	/* One bounded fresh read per request; not charged to the fault budget. */
+	pm->provider_busy = false;
+	pm->phase = CD321X_PM_REVALIDATE;
+	pm->attempts_left = CD321X_RESUME_ATTEMPTS;
+	return true;
+}
+
 #define CD321X_PM_FAULT_ACCEPTED	0x1U
 #define CD321X_PM_FAULT_REFUSED		0x2U
 #define CD321X_PM_READY_ACCEPTED	0x4U
+#define CD321X_PM_RESTORE_ACCEPTED	0x8U
 
 /*
  * Apply the link fault and activation completion one worker pass collected.
@@ -120,10 +135,13 @@ static inline bool cd321x_pm_activation_ready(struct cd321x_pm_state *pm)
  * completion.
  */
 static inline unsigned int cd321x_pm_notifications(struct cd321x_pm_state *pm,
-						   bool fault, bool ready)
+						   bool fault, bool ready,
+						   bool restore)
 {
 	unsigned int res = 0;
 
+	if (restore && cd321x_pm_restore(pm))
+		res |= CD321X_PM_RESTORE_ACCEPTED;
 	if (fault)
 		res |= cd321x_pm_link_event(pm) ? CD321X_PM_FAULT_ACCEPTED :
 						  CD321X_PM_FAULT_REFUSED;

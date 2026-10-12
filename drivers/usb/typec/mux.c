@@ -657,6 +657,20 @@ void typec_thunderbolt_switch_notify_ready(struct typec_thunderbolt_switch_dev *
 }
 EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_notify_ready);
 
+/**
+ * typec_thunderbolt_switch_notify_restore - Request a cable read after sleep
+ * @sw: Registered provider switch
+ *
+ * The provider powered itself down for system sleep and needs the current
+ * cable state reapplied. Unlike a revalidation this reports no link fault.
+ */
+void typec_thunderbolt_switch_notify_restore(struct typec_thunderbolt_switch_dev *sw)
+{
+	atomic_notifier_call_chain(&sw->notifiers,
+				   TYPEC_THUNDERBOLT_SWITCH_RESTORE, NULL);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_notify_restore);
+
 static void typec_thunderbolt_switch_release(struct device *dev)
 {
 	kfree(to_typec_thunderbolt_switch_dev(dev));

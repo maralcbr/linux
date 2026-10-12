@@ -1114,7 +1114,7 @@ static void cd321x_resume_work(struct work_struct *work)
 	struct tps6598x *tps = &cd321x->tps;
 	unsigned int notes;
 	u32 status;
-	bool fault, ready;
+	bool fault, ready, restore;
 
 	guard(mutex)(&tps->lock);
 	if (cd321x->pm.phase == CD321X_PM_INITIALIZING ||
@@ -1127,13 +1127,15 @@ static void cd321x_resume_work(struct work_struct *work)
 
 	fault = atomic_xchg(&cd321x->link_event, 0);
 	ready = atomic_xchg(&cd321x->ready_event, 0);
-	notes = cd321x_pm_notifications(&cd321x->pm, fault, ready);
+	restore = atomic_xchg(&cd321x->restore_event, 0);
+	notes = cd321x_pm_notifications(&cd321x->pm, fault, ready, restore);
 	if (notes & CD321X_PM_FAULT_ACCEPTED)
 		dev_info(tps->dev, "revalidating cable after tunnel state change\n");
 	if (notes & CD321X_PM_FAULT_REFUSED)
 		dev_warn_ratelimited(tps->dev,
 				     "tunnel link recovery budget exhausted\n");
-	if (notes & (CD321X_PM_FAULT_ACCEPTED | CD321X_PM_READY_ACCEPTED))
+	if (notes & (CD321X_PM_FAULT_ACCEPTED | CD321X_PM_READY_ACCEPTED |
+		     CD321X_PM_RESTORE_ACCEPTED))
 		cd321x->state_valid = false;
 	if (!cd321x_pm_begin_read(&cd321x->pm))
 		return;
@@ -1659,12 +1661,15 @@ static int cd321x_tbt_notify(struct notifier_block *nb,
 	struct cd321x *cd321x = container_of(nb, struct cd321x, tbt_notifier);
 
 	if (event != TYPEC_THUNDERBOLT_SWITCH_REVALIDATE &&
-	    event != TYPEC_THUNDERBOLT_SWITCH_READY)
+	    event != TYPEC_THUNDERBOLT_SWITCH_READY &&
+	    event != TYPEC_THUNDERBOLT_SWITCH_RESTORE)
 		return NOTIFY_DONE;
 
 	/* Publish the event even if the worker is already reading or applying. */
 	if (event == TYPEC_THUNDERBOLT_SWITCH_READY)
 		atomic_set(&cd321x->ready_event, 1);
+	else if (event == TYPEC_THUNDERBOLT_SWITCH_RESTORE)
+		atomic_set(&cd321x->restore_event, 1);
 	else
 		atomic_set(&cd321x->link_event, 1);
 	mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
@@ -1709,6 +1714,7 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	INIT_DELAYED_WORK(&cd321x->resume_work, cd321x_resume_work);
 	atomic_set(&cd321x->link_event, 0);
 	atomic_set(&cd321x->ready_event, 0);
+	atomic_set(&cd321x->restore_event, 0);
 	cd321x_pm_init(&cd321x->pm);
 
 	ret = tps6598x_register_port(tps, fwnode);
