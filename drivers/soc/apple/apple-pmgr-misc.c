@@ -57,11 +57,19 @@ static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
 	writel_relaxed(val, misc->devices[dev].base);
 }
 
+/* LAB ONLY: skip the fabric/DCS suspend requests, to test their interaction with PMP. */
+static bool lab_skip_suspend;
+module_param(lab_skip_suspend, bool, 0644);
+
 static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
 {
 	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
 	int i;
 
+	if (READ_ONCE(lab_skip_suspend)) {
+		dev_info(dev, "lab: skipping fabric/DCS suspend p-states\n");
+		return 0;
+	}
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, false);
 
@@ -73,6 +81,8 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
 	int i;
 
+	if (READ_ONCE(lab_skip_suspend))
+		return 0;
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, true);
 
