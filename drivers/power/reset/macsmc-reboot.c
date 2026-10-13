@@ -13,6 +13,10 @@
 #include <linux/platform_device.h>
 #include <linux/reboot.h>
 #include <linux/slab.h>
+#include <linux/io.h>
+#include <linux/smp.h>
+#include <linux/suspend.h>
+#include <asm/daifflags.h>
 
 struct macsmc_reboot_nvmem {
 	struct nvmem_cell *shutdown_flag;
@@ -199,6 +203,80 @@ static void macsmc_power_init_error_counts(struct macsmc_reboot *reboot)
 		dev_err(reboot->dev, "Failed to reset boot_error_count\n");
 }
 
+
+/*
+ * LAB ONLY: one-way replay of the sleep-entry sequence macOS 15.6.1 runs on
+ * j314s (traced under the m1n1 hypervisor), to measure the power floor Linux
+ * reaches once every CPU is powered down. There is no resume path: the Mac
+ * stays asleep until the lab's out-of-band reset. bit0 = SMC/PMGR sequence,
+ * bit1 = CPU power-down.
+ */
+static unsigned int lab_s2r_floor;
+module_param(lab_s2r_floor, uint, 0644);
+MODULE_PARM_DESC(lab_s2r_floor, "LAB ONLY: replay macOS sleep entry at s2idle prepare_late and never return (bit0 SMC/PMGR, bit1 CPU power-down)");
+
+static struct macsmc_reboot *lab_reboot;
+
+#define LAB_PMGR_SLEEP_REQ	0x28e3d8328ULL	/* PMGR reg 41 + 0x18328: macOS writes 4, later 1 */
+#define LAB_PMP_DVFS4		0x28e3d0860ULL	/* SOC-DEV-DVFS + 4: macOS writes 1 << 61 */
+
+static void lab_floor_cpu(void *unused)
+{
+	u64 acc, cyc;
+
+	local_daif_mask();
+	asm volatile("mrs %0, s3_5_c15_c6_0" : "=r"(acc));
+	acc &= ~(GENMASK_ULL(18, 13) | GENMASK_ULL(26, 25));
+	acc |= BIT_ULL(13) | (3ULL << 17) | (3ULL << 25) | BIT_ULL(32) | BIT_ULL(34);
+	asm volatile("msr s3_5_c15_c6_0, %0" :: "r"(acc));
+	asm volatile("mrs %0, s3_5_c15_c5_0" : "=r"(cyc));
+	cyc |= 0x3000001ULL;
+	asm volatile("msr s3_5_c15_c5_0, %0; isb" :: "r"(cyc));
+	for (;;)
+		asm volatile("dsb sy; wfi");
+}
+
+static int lab_s2r_prepare_late(void)
+{
+	struct apple_smc *smc = lab_reboot->smc;
+	void __iomem *req, *dvfs;
+	int ret;
+
+	if (!lab_s2r_floor)
+		return 0;
+
+	req = ioremap(LAB_PMGR_SLEEP_REQ & PAGE_MASK, PAGE_SIZE);
+	dvfs = ioremap(LAB_PMP_DVFS4 & PAGE_MASK, PAGE_SIZE);
+	if (!req || !dvfs)
+		return 0;
+
+	if (lab_s2r_floor & 1) {
+		writel(4, req + (LAB_PMGR_SLEEP_REQ & ~PAGE_MASK));
+		ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpw));
+		pr_emerg("lab_s2r_floor: MBSE=slpw %d\n", ret);
+		ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), 0x100);
+		pr_emerg("lab_s2r_floor: pmVC=0x100 %d\n", ret);
+		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), 2);
+		pr_emerg("lab_s2r_floor: WKTP=2 %d\n", ret);
+		writeq(1ULL << 61, dvfs + (LAB_PMP_DVFS4 & ~PAGE_MASK));
+		writel(1, req + (LAB_PMGR_SLEEP_REQ & ~PAGE_MASK));
+		ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpa));
+		pr_emerg("lab_s2r_floor: MBSE=slpa %d\n", ret);
+	}
+	if (lab_s2r_floor & 2) {
+		pr_emerg("lab_s2r_floor: powering down all CPUs, no return\n");
+		mdelay(100);
+		smp_call_function(lab_floor_cpu, NULL, 0);
+		mdelay(50);
+		lab_floor_cpu(NULL);
+	}
+	return 0;
+}
+
+static const struct platform_s2idle_ops lab_s2r_ops = {
+	.prepare_late = lab_s2r_prepare_late,
+};
+
 static int macsmc_reboot_probe(struct platform_device *pdev)
 {
 	struct apple_smc *smc = dev_get_drvdata(pdev->dev.parent);
@@ -272,6 +350,9 @@ static int macsmc_reboot_probe(struct platform_device *pdev)
 	ret = devm_register_reboot_notifier(&pdev->dev, &reboot->reboot_notify);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "Failed to register reboot notifier\n");
+
+	lab_reboot = reboot;
+	s2idle_set_ops(&lab_s2r_ops);
 
 	dev_info(&pdev->dev, "Handling reboot and poweroff requests via SMC\n");
 
