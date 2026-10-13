@@ -314,6 +314,27 @@ static bool lab_post_skipped(int idx)
 	return false;
 }
 
+static bool lab_post_fast = true;
+module_param(lab_post_fast, bool, 0644);
+MODULE_PARM_DESC(lab_post_fast, "LAB ONLY: replay post-slpa writes back to back (pre-mapped, no prints or delays)");
+
+static void __iomem *lab_post_map[ARRAY_SIZE(lab_post_slpa)];
+
+static void lab_replay_post_slpa_fast(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(lab_post_slpa); i++) {
+		if (!lab_post_map[i] || lab_post_skipped(i))
+			continue;
+		if (lab_post_slpa[i].width == 8)
+			writeq_relaxed(lab_post_slpa[i].val, lab_post_map[i]);
+		else
+			writel_relaxed(lab_post_slpa[i].val, lab_post_map[i]);
+	}
+	dsb(sy);
+}
+
 static void lab_replay_post_slpa(void)
 {
 	int i;
@@ -369,6 +390,16 @@ static int lab_s2r_prepare_late(void)
 	if (!req || !dvfs)
 		return 0;
 
+	if ((lab_s2r_floor & 8) && lab_post_fast) {
+		int i;
+
+		for (i = 0; i < ARRAY_SIZE(lab_post_slpa); i++) {
+			lab_post_map[i] = ioremap(lab_post_slpa[i].addr & PAGE_MASK, PAGE_SIZE);
+			if (lab_post_map[i])
+				lab_post_map[i] += lab_post_slpa[i].addr & ~PAGE_MASK;
+		}
+		pr_emerg("lab_s2r_floor: fast mode: post-slpa writes and CPU power-down follow slpa with no output\n");
+	}
 	if (lab_s2r_floor & 4)
 		writel(4, req + (LAB_PMGR_SLEEP_REQ & ~PAGE_MASK));
 	if (lab_s2r_floor & 1) {
@@ -385,9 +416,17 @@ static int lab_s2r_prepare_late(void)
 	}
 	if (lab_s2r_floor & 1) {
 		ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpa));
-		pr_emerg("lab_s2r_floor: MBSE=slpa %d\n", ret);
+		if (!((lab_s2r_floor & 8) && lab_post_fast))
+			pr_emerg("lab_s2r_floor: MBSE=slpa %d\n", ret);
 	}
-	if (lab_s2r_floor & 8) {
+	if ((lab_s2r_floor & 8) && lab_post_fast) {
+		lab_replay_post_slpa_fast();
+		if (lab_s2r_floor & 2) {
+			smp_call_function(lab_floor_cpu, NULL, 0);
+			lab_floor_cpu(NULL);
+		}
+	}
+	if ((lab_s2r_floor & 8) && !lab_post_fast) {
 		pr_emerg("lab_s2r_floor: replaying %zu post-slpa writes\n", ARRAY_SIZE(lab_post_slpa));
 		mdelay(50);
 		lab_replay_post_slpa();
