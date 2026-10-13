@@ -211,7 +211,7 @@ static void macsmc_power_init_error_counts(struct macsmc_reboot *reboot)
  * stays asleep until the lab's out-of-band reset. bit0 = SMC keys,
  * bit1 = CPU power-down, bit2 = PMGR/PMP register writes, bit3 = the
  * post-slpa PMGR/watchdog/error-handler writes, bit4 = run from s2idle
- * prepare (before noirq, PM domains still on) instead of prepare_late.
+ * prepare instead of prepare_late, bit5 = disable all three SoC watchdog channels.
  */
 static unsigned int lab_s2r_floor;
 module_param(lab_s2r_floor, uint, 0644);
@@ -454,6 +454,19 @@ static int lab_s2r_prepare_late(void)
 	return (lab_s2r_floor & 16) ? 0 : lab_s2r_run();
 }
 
+static void lab_dump_wdt(const char *when)
+{
+	void __iomem *w = ioremap_np(0x2922b0000ULL, 0x40);
+	int ch;
+
+	if (!w)
+		return;
+	for (ch = 0; ch < 3; ch++)
+		pr_emerg("lab_wdt %s: ch%d ctl %08x count %08x bite %08x\n", when, ch,
+			 readl(w + 0x0c + 0x10 * ch), readl(w + 0x10 * ch), readl(w + 0x04 + 0x10 * ch));
+	iounmap(w);
+}
+
 static int lab_s2r_run(void)
 {
 	struct apple_smc *smc = lab_reboot->smc;
@@ -462,6 +475,16 @@ static int lab_s2r_run(void)
 
 	if (!lab_s2r_floor)
 		return 0;
+
+	lab_dump_wdt("entry");
+	if (lab_s2r_floor & 32) {
+		void __iomem *w = ioremap_np(0x2922b0000ULL, 0x40);
+		int ch;
+
+		for (ch = 0; w && ch < 3; ch++)
+			writel(0, w + 0x0c + 0x10 * ch);
+		lab_dump_wdt("all-off");
+	}
 
 	req = ioremap_np(LAB_PMGR_SLEEP_REQ & PAGE_MASK, PAGE_SIZE);
 	dvfs = ioremap_np(LAB_PMP_DVFS4 & PAGE_MASK, PAGE_SIZE);
