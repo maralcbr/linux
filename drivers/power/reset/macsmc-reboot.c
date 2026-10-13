@@ -298,13 +298,35 @@ static const struct { u64 addr; u8 width; u64 val; } lab_post_slpa[] = {
 	{ 0x2925c4000ULL, 4, 0x1ULL },	/* pmgr[36]+0x4000 */
 };
 
+static char lab_post_skip[128];
+module_param_string(lab_post_skip, lab_post_skip, sizeof(lab_post_skip), 0644);
+MODULE_PARM_DESC(lab_post_skip, "LAB ONLY: comma-separated indexes of post-slpa writes to skip");
+
+static bool lab_post_skipped(int idx)
+{
+	char buf[sizeof(lab_post_skip)], *cur = buf, *tok;
+	int n;
+
+	strscpy(buf, lab_post_skip, sizeof(buf));
+	while ((tok = strsep(&cur, ",")))
+		if (!kstrtoint(tok, 10, &n) && n == idx)
+			return true;
+	return false;
+}
+
 static void lab_replay_post_slpa(void)
 {
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(lab_post_slpa); i++) {
-		void __iomem *p = ioremap(lab_post_slpa[i].addr & PAGE_MASK, PAGE_SIZE);
+		void __iomem *p;
 
+		if (lab_post_skipped(i))
+			continue;
+		pr_emerg("lab_s2r_floor: post[%d] %llx w%u = %llx\n", i, lab_post_slpa[i].addr,
+			 lab_post_slpa[i].width, lab_post_slpa[i].val);
+		mdelay(20);
+		p = ioremap(lab_post_slpa[i].addr & PAGE_MASK, PAGE_SIZE);
 		if (!p)
 			continue;
 		p += lab_post_slpa[i].addr & ~PAGE_MASK;
@@ -312,6 +334,8 @@ static void lab_replay_post_slpa(void)
 			writeq(lab_post_slpa[i].val, p);
 		else
 			writel(lab_post_slpa[i].val, p);
+		dsb(sy);
+		mdelay(20);
 	}
 }
 
