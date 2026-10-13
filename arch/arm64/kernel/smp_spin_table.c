@@ -11,6 +11,7 @@
 #include <linux/smp.h>
 #include <linux/types.h>
 #include <linux/mm.h>
+#include <linux/moduleparam.h>
 
 #include <asm/cacheflush.h>
 #include <asm/cpu_ops.h>
@@ -104,8 +105,113 @@ static int smp_spin_table_cpu_prepare(unsigned int cpu)
 	return 0;
 }
 
+
+#ifdef CONFIG_HOTPLUG_CPU
+/*
+ * LAB ONLY: CPU offline/online for Apple t6000 (j314s) on spin-table. A dying
+ * core asks PMGR to stop it and enters deep WFI with power-down enabled (as
+ * m1n1's smp_stop_cpu/cpu_sleep do). Bringing it back asks PMGR to start it:
+ * the core re-enters through RVBAR, which still points at the resident m1n1,
+ * whose secondary path re-runs its CPU init and jumps back into the holding
+ * pen through the spin table. Only one core may restart at a time (the
+ * installed m1n1 shares one reset stack).
+ */
+static bool apple_hotplug;
+core_param(apple_hotplug, apple_hotplug, bool, 0644);
+
+#define APPLE_T6000_CPU_START	0x28e0d4000UL
+#define APPLE_T6000_IMPL_BASE	0x210050000UL
+
+static void __iomem *apple_cpu_start_base;
+static bool apple_cpu_stopped[NR_CPUS];
+
+static bool apple_hotplug_ok(void)
+{
+	return apple_hotplug && of_machine_is_compatible("apple,t6000");
+}
+
+static unsigned long apple_impl_reg(u64 mpidr)
+{
+	return APPLE_T6000_IMPL_BASE + MPIDR_AFFINITY_LEVEL(mpidr, 1) * 0x1000000UL +
+	       MPIDR_AFFINITY_LEVEL(mpidr, 0) * 0x100000UL;
+}
+
+static int smp_spin_table_cpu_disable(unsigned int cpu)
+{
+	if (!apple_hotplug_ok())
+		return -EOPNOTSUPP;
+	if (!apple_cpu_start_base)
+		apple_cpu_start_base = ioremap(APPLE_T6000_CPU_START, PAGE_SIZE);
+	return apple_cpu_start_base ? 0 : -ENOMEM;
+}
+
+static void smp_spin_table_cpu_die(unsigned int cpu)
+{
+	u64 mpidr = cpu_logical_map(cpu);
+	u32 cl = MPIDR_AFFINITY_LEVEL(mpidr, 1), core = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+	u64 acc, cyc;
+
+	writel_relaxed(BIT(4 * cl + core), apple_cpu_start_base + 0x0);
+	dsb(sy);
+
+	/* ACC_OVRD: PWR_DN_SRM(3) DIS_L2_FLUSH_ACC_SLEEP(2) TRAIN_DOWN_LINK(3) POWER_DOWN_CPM(3) DISABLE_PIO_ON_WFI_CPU DEEP_SLEEP */
+	asm volatile("mrs %0, s3_5_c15_c6_0" : "=r"(acc));
+	acc &= ~GENMASK_ULL(16, 15);
+	acc |= (3ULL << 13) | (2ULL << 15) | (3ULL << 17) | (3ULL << 25) | BIT_ULL(32) | BIT_ULL(34);
+	asm volatile("msr s3_5_c15_c6_0, %0" :: "r"(acc));
+	/* CYC_OVRD: WFI mode 3 (power down), WFI retention off */
+	asm volatile("mrs %0, s3_5_c15_c5_0" : "=r"(cyc));
+	cyc = (cyc & ~GENMASK_ULL(25, 24)) | (3ULL << 24) | BIT_ULL(0);
+	asm volatile("msr s3_5_c15_c5_0, %0; isb" :: "r"(cyc));
+
+	for (;;)
+		asm volatile("dsb sy; wfi");
+}
+
+static int smp_spin_table_cpu_kill(unsigned int cpu)
+{
+	u64 mpidr = cpu_logical_map(cpu);
+	void __iomem *impl = ioremap(apple_impl_reg(mpidr) + 0x100, 8);
+	u64 st = 0xff;
+	int i;
+
+	if (!impl)
+		return 0;
+	for (i = 0; i < 50; i++) {
+		st = readq(impl);
+		if (!(st & 0xff))
+			break;
+		mdelay(1);
+	}
+	iounmap(impl);
+	pr_info("apple_hotplug: cpu%u stop status %llx after %d ms\n", cpu, st, i);
+	if (st & 0xff)
+		return 0;
+	apple_cpu_stopped[cpu] = true;
+	return 1;
+}
+
+static int apple_cpu_restart(unsigned int cpu)
+{
+	u64 mpidr = cpu_logical_map(cpu);
+	u32 cl = MPIDR_AFFINITY_LEVEL(mpidr, 1), core = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+
+	apple_cpu_stopped[cpu] = false;
+	write_pen_release(mpidr);
+	writel_relaxed(BIT(4 * cl + core), apple_cpu_start_base + 0x4);
+	writel_relaxed(BIT(core), apple_cpu_start_base + 0x8 + 4 * cl);
+	dsb(sy);
+	sev();
+	return 0;
+}
+#endif
+
 static int smp_spin_table_cpu_boot(unsigned int cpu)
 {
+#ifdef CONFIG_HOTPLUG_CPU
+	if (apple_cpu_stopped[cpu])
+		return apple_cpu_restart(cpu);
+#endif
 	/*
 	 * Update the pen release flag.
 	 */
@@ -124,4 +230,9 @@ const struct cpu_operations smp_spin_table_ops = {
 	.cpu_init	= smp_spin_table_cpu_init,
 	.cpu_prepare	= smp_spin_table_cpu_prepare,
 	.cpu_boot	= smp_spin_table_cpu_boot,
+#ifdef CONFIG_HOTPLUG_CPU
+	.cpu_disable	= smp_spin_table_cpu_disable,
+	.cpu_die	= smp_spin_table_cpu_die,
+	.cpu_kill	= smp_spin_table_cpu_kill,
+#endif
 };
