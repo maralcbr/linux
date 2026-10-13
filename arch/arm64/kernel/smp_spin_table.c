@@ -190,10 +190,9 @@ static int smp_spin_table_cpu_kill(unsigned int cpu)
 	}
 	iounmap(impl);
 	pr_info("apple_hotplug: cpu%u stop status %llx after %d ms\n", cpu, st, i);
-	if (st & 0xff)
-		return 0;
+	/* The core is parked in power-down WFI either way: restart it through PMGR. */
 	apple_cpu_stopped[cpu] = true;
-	return 1;
+	return !(st & 0xff);
 }
 
 static int apple_cpu_restart(unsigned int cpu)
@@ -207,6 +206,7 @@ static int apple_cpu_restart(unsigned int cpu)
 	writel_relaxed(BIT(core), apple_cpu_start_base + 0x8 + 4 * cl);
 	dsb(sy);
 	sev();
+	pr_info("apple_hotplug: cpu%u start requested (cluster %u core %u)\n", cpu, cl, core);
 	return 0;
 }
 #endif
