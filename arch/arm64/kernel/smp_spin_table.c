@@ -153,6 +153,17 @@ static int smp_spin_table_cpu_disable(unsigned int cpu)
 	return apple_cpu_start_base ? 0 : -ENOMEM;
 }
 
+/* Called on the dying CPU after it left cpu_online_mask. */
+static bool apple_last_in_cluster(unsigned int cpu, u32 cl)
+{
+	unsigned int other;
+
+	for_each_online_cpu(other)
+		if (other != cpu && MPIDR_AFFINITY_LEVEL(cpu_logical_map(other), 1) == cl)
+			return false;
+	return true;
+}
+
 static void smp_spin_table_cpu_die(unsigned int cpu)
 {
 	u64 mpidr = cpu_logical_map(cpu);
@@ -167,7 +178,7 @@ static void smp_spin_table_cpu_die(unsigned int cpu)
 	 * core's CYC_OVRD changes (ACC_OVRD is cluster-wide). FIQ/IRQ mode 2,
 	 * WFI mode 3 (power down), WFI retention disabled.
 	 */
-	if (apple_hotplug_deep) {
+	if (apple_hotplug_deep && apple_last_in_cluster(cpu, cl)) {
 		u64 acc;
 
 		/* PWR_DN_SRM(3) DIS_L2_FLUSH_ACC_SLEEP(2) TRAIN_DOWN_LINK(3) POWER_DOWN_CPM(3) DISABLE_PIO_ON_WFI_CPU DEEP_SLEEP */
