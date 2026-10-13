@@ -335,6 +335,32 @@ static void lab_replay_post_slpa_fast(void)
 	dsb(sy);
 }
 
+static int lab_probe_set(const char *val, const struct kernel_param *kp)
+{
+	void __iomem *p;
+	int idx;
+	u64 v;
+
+	if (kstrtoint(val, 10, &idx) || idx < 0 || idx >= ARRAY_SIZE(lab_post_slpa))
+		return -EINVAL;
+	pr_emerg("lab_probe: [%d] %llx w%u reading\n", idx, lab_post_slpa[idx].addr, lab_post_slpa[idx].width);
+	p = ioremap(lab_post_slpa[idx].addr & PAGE_MASK, PAGE_SIZE);
+	if (!p)
+		return -ENOMEM;
+	p += lab_post_slpa[idx].addr & ~PAGE_MASK;
+	v = lab_post_slpa[idx].width == 8 ? readq(p) : readl(p);
+	dsb(sy);
+	mdelay(5);
+	pr_emerg("lab_probe: [%d] %llx = %llx (macOS writes %llx)\n", idx, lab_post_slpa[idx].addr, v,
+		 lab_post_slpa[idx].val);
+	iounmap(p - (lab_post_slpa[idx].addr & ~PAGE_MASK));
+	return 0;
+}
+
+static const struct kernel_param_ops lab_probe_ops = { .set = lab_probe_set };
+module_param_cb(lab_probe, &lab_probe_ops, NULL, 0200);
+MODULE_PARM_DESC(lab_probe, "LAB ONLY: read post-slpa table entry N and log it");
+
 static void lab_replay_post_slpa(void)
 {
 	int i;
