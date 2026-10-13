@@ -6,6 +6,9 @@
 
 #include "rtkit-internal.h"
 
+/* LAB ONLY: the AOP's RTKit instance, so the sleep experiments can set its AP power state. */
+static struct apple_rtkit *lab_aop_rtk;
+
 enum {
 	APPLE_RTKIT_PWR_STATE_OFF = 0x00, /* power off, cannot be restarted */
 	APPLE_RTKIT_PWR_STATE_SLEEP = 0x01, /* sleeping, can be restarted */
@@ -884,6 +887,8 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 		return ERR_PTR(-ENOMEM);
 
 	rtk->dev = dev;
+	if (strstr(dev_name(dev), "aop"))
+		lab_aop_rtk = rtk;
 	rtk->cookie = cookie;
 	rtk->ops = ops;
 
@@ -1160,6 +1165,15 @@ int apple_rtkit_idle(struct apple_rtkit *rtk)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_idle);
+
+/* LAB ONLY: tell the AOP the AP is going idle (macOS: SetAPPower 0x201 before MBSE=slpa). */
+int lab_rtkit_aop_ap_idle(void)
+{
+	if (!lab_aop_rtk)
+		return -ENODEV;
+	return apple_rtkit_set_ap_power_state(lab_aop_rtk, APPLE_RTKIT_PWR_STATE_IDLE);
+}
+EXPORT_SYMBOL_GPL(lab_rtkit_aop_ap_idle);
 
 int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 {
