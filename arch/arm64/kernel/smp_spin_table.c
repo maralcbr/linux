@@ -136,6 +136,11 @@ static unsigned long apple_impl_reg(u64 mpidr)
 	       MPIDR_AFFINITY_LEVEL(mpidr, 0) * 0x100000UL;
 }
 
+static bool smp_spin_table_cpu_can_disable(unsigned int cpu)
+{
+	return apple_hotplug_ok();
+}
+
 static int smp_spin_table_cpu_disable(unsigned int cpu)
 {
 	if (!apple_hotplug_ok())
@@ -231,6 +236,7 @@ const struct cpu_operations smp_spin_table_ops = {
 	.cpu_prepare	= smp_spin_table_cpu_prepare,
 	.cpu_boot	= smp_spin_table_cpu_boot,
 #ifdef CONFIG_HOTPLUG_CPU
+	.cpu_can_disable = smp_spin_table_cpu_can_disable,
 	.cpu_disable	= smp_spin_table_cpu_disable,
 	.cpu_die	= smp_spin_table_cpu_die,
 	.cpu_kill	= smp_spin_table_cpu_kill,
