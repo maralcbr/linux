@@ -118,6 +118,9 @@ static int smp_spin_table_cpu_prepare(unsigned int cpu)
  */
 static bool apple_hotplug;
 core_param(apple_hotplug, apple_hotplug, bool, 0644);
+/* LAB ONLY: offline with the cluster deep-sleep ACC_OVRD fields too (m1n1 SLEEP_GLOBAL), for the system-sleep experiments. */
+static bool apple_hotplug_deep;
+core_param(apple_hotplug_deep, apple_hotplug_deep, bool, 0644);
 
 #define APPLE_T6000_CPU_START	0x28e0d4000UL
 #define APPLE_T6000_IMPL_BASE	0x210050000UL
@@ -164,6 +167,15 @@ static void smp_spin_table_cpu_die(unsigned int cpu)
 	 * core's CYC_OVRD changes (ACC_OVRD is cluster-wide). FIQ/IRQ mode 2,
 	 * WFI mode 3 (power down), WFI retention disabled.
 	 */
+	if (apple_hotplug_deep) {
+		u64 acc;
+
+		/* PWR_DN_SRM(3) DIS_L2_FLUSH_ACC_SLEEP(2) TRAIN_DOWN_LINK(3) POWER_DOWN_CPM(3) DISABLE_PIO_ON_WFI_CPU DEEP_SLEEP */
+		asm volatile("mrs %0, s3_5_c15_c6_0" : "=r"(acc));
+		acc &= ~GENMASK_ULL(16, 15);
+		acc |= (3ULL << 13) | (2ULL << 15) | (3ULL << 17) | (3ULL << 25) | BIT_ULL(32) | BIT_ULL(34);
+		asm volatile("msr s3_5_c15_c6_0, %0" :: "r"(acc));
+	}
 	asm volatile("mrs %0, s3_5_c15_c5_0" : "=r"(cyc));
 	cyc &= ~(GENMASK_ULL(23, 20) | GENMASK_ULL(25, 24));
 	cyc |= (2ULL << 22) | (2ULL << 20) | (3ULL << 24) | BIT_ULL(0);
