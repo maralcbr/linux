@@ -314,6 +314,18 @@ static bool lab_post_skipped(int idx)
 	return false;
 }
 
+static bool lab_eh_early = true;
+module_param(lab_eh_early, bool, 0644);
+MODULE_PARM_DESC(lab_eh_early, "LAB ONLY: write the watchdog/error-handler entries of the post-slpa table before the SMC handshake");
+
+static bool lab_post_is_eh(int i)
+{
+	u64 a = lab_post_slpa[i].addr;
+
+	return a == 0x2922b000cULL || (a & 0xfff) == 0xa00 ||
+	       (a >= 0x28e030000ULL && a < 0x28e100000ULL);
+}
+
 static bool lab_post_fast = true;
 module_param(lab_post_fast, bool, 0644);
 MODULE_PARM_DESC(lab_post_fast, "LAB ONLY: replay post-slpa writes back to back (pre-mapped, no prints or delays)");
@@ -325,7 +337,7 @@ static void lab_replay_post_slpa_fast(void)
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(lab_post_slpa); i++) {
-		if (!lab_post_map[i] || lab_post_skipped(i))
+		if (!lab_post_map[i] || lab_post_skipped(i) || (lab_eh_early && lab_post_is_eh(i)))
 			continue;
 		if (lab_post_slpa[i].width == 8)
 			writeq_relaxed(lab_post_slpa[i].val, lab_post_map[i]);
@@ -425,6 +437,15 @@ static int lab_s2r_prepare_late(void)
 				lab_post_map[i] += lab_post_slpa[i].addr & ~PAGE_MASK;
 		}
 		pr_emerg("lab_s2r_floor: fast mode: post-slpa writes and CPU power-down follow slpa with no output\n");
+		if (lab_eh_early) {
+			for (i = 0; i < ARRAY_SIZE(lab_post_slpa); i++) {
+				if (!lab_post_map[i] || !lab_post_is_eh(i) || lab_post_skipped(i))
+					continue;
+				writel(lab_post_slpa[i].val, lab_post_map[i]);
+			}
+			dsb(sy);
+			pr_emerg("lab_s2r_floor: error handlers masked before the handshake\n");
+		}
 	}
 	if (lab_s2r_floor & 4)
 		writel(4, req + (LAB_PMGR_SLEEP_REQ & ~PAGE_MASK));
