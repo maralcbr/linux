@@ -357,7 +357,7 @@ static int lab_probe_set(const char *val, const struct kernel_param *kp)
 	if (kstrtoint(val, 10, &idx) || idx < 0 || idx >= ARRAY_SIZE(lab_post_slpa))
 		return -EINVAL;
 	pr_emerg("lab_probe: [%d] %llx w%u reading\n", idx, lab_post_slpa[idx].addr, lab_post_slpa[idx].width);
-	p = ioremap(lab_post_slpa[idx].addr & PAGE_MASK, PAGE_SIZE);
+	p = ioremap_np(lab_post_slpa[idx].addr & PAGE_MASK, PAGE_SIZE);
 	if (!p)
 		return -ENOMEM;
 	p += lab_post_slpa[idx].addr & ~PAGE_MASK;
@@ -379,7 +379,7 @@ static int lab_probe_write_set(const char *val, const struct kernel_param *kp)
 		return -EINVAL;
 	pr_emerg("lab_probe: [%d] %llx w%u writing %llx\n", idx, lab_post_slpa[idx].addr,
 		 lab_post_slpa[idx].width, lab_post_slpa[idx].val);
-	p = ioremap(lab_post_slpa[idx].addr & PAGE_MASK, PAGE_SIZE);
+	p = ioremap_np(lab_post_slpa[idx].addr & PAGE_MASK, PAGE_SIZE);
 	if (!p)
 		return -ENOMEM;
 	if (lab_post_slpa[idx].width == 8)
@@ -413,7 +413,7 @@ static void lab_replay_post_slpa(void)
 		pr_emerg("lab_s2r_floor: post[%d] %llx w%u = %llx\n", i, lab_post_slpa[i].addr,
 			 lab_post_slpa[i].width, lab_post_slpa[i].val);
 		mdelay(20);
-		p = ioremap(lab_post_slpa[i].addr & PAGE_MASK, PAGE_SIZE);
+		p = ioremap_np(lab_post_slpa[i].addr & PAGE_MASK, PAGE_SIZE);
 		if (!p)
 			continue;
 		p += lab_post_slpa[i].addr & ~PAGE_MASK;
@@ -463,8 +463,8 @@ static int lab_s2r_run(void)
 	if (!lab_s2r_floor)
 		return 0;
 
-	req = ioremap(LAB_PMGR_SLEEP_REQ & PAGE_MASK, PAGE_SIZE);
-	dvfs = ioremap(LAB_PMP_DVFS4 & PAGE_MASK, PAGE_SIZE);
+	req = ioremap_np(LAB_PMGR_SLEEP_REQ & PAGE_MASK, PAGE_SIZE);
+	dvfs = ioremap_np(LAB_PMP_DVFS4 & PAGE_MASK, PAGE_SIZE);
 	if (!req || !dvfs)
 		return 0;
 
@@ -472,7 +472,7 @@ static int lab_s2r_run(void)
 		int i;
 
 		for (i = 0; i < ARRAY_SIZE(lab_post_slpa); i++) {
-			lab_post_map[i] = ioremap(lab_post_slpa[i].addr & PAGE_MASK, PAGE_SIZE);
+			lab_post_map[i] = ioremap_np(lab_post_slpa[i].addr & PAGE_MASK, PAGE_SIZE);
 			if (lab_post_map[i])
 				lab_post_map[i] += lab_post_slpa[i].addr & ~PAGE_MASK;
 		}

@@ -146,7 +146,7 @@ static int smp_spin_table_cpu_disable(unsigned int cpu)
 	if (!apple_hotplug_ok())
 		return -EOPNOTSUPP;
 	if (!apple_cpu_start_base)
-		apple_cpu_start_base = ioremap(APPLE_T6000_CPU_START, PAGE_SIZE);
+		apple_cpu_start_base = ioremap_np(APPLE_T6000_CPU_START, PAGE_SIZE);
 	return apple_cpu_start_base ? 0 : -ENOMEM;
 }
 
@@ -176,7 +176,7 @@ static void smp_spin_table_cpu_die(unsigned int cpu)
 static int smp_spin_table_cpu_kill(unsigned int cpu)
 {
 	u64 mpidr = cpu_logical_map(cpu);
-	void __iomem *impl = ioremap(apple_impl_reg(mpidr) + 0x100, 8);
+	void __iomem *impl = ioremap_np(apple_impl_reg(mpidr) + 0x100, 8);
 	u64 st = 0xff;
 	int i;
 
