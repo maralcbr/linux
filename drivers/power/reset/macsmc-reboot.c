@@ -209,7 +209,8 @@ static void macsmc_power_init_error_counts(struct macsmc_reboot *reboot)
  * j314s (traced under the m1n1 hypervisor), to measure the power floor Linux
  * reaches once every CPU is powered down. There is no resume path: the Mac
  * stays asleep until the lab's out-of-band reset. bit0 = SMC keys,
- * bit1 = CPU power-down, bit2 = PMGR/PMP register writes.
+ * bit1 = CPU power-down, bit2 = PMGR/PMP register writes, bit3 = the
+ * post-slpa PMGR/watchdog/error-handler writes.
  */
 static unsigned int lab_s2r_floor;
 module_param(lab_s2r_floor, uint, 0644);
@@ -219,6 +220,100 @@ static struct macsmc_reboot *lab_reboot;
 
 #define LAB_PMGR_SLEEP_REQ	0x28e3d8328ULL	/* PMGR reg 41 + 0x18328: macOS writes 4, later 1 */
 #define LAB_PMP_DVFS4		0x28e3d0860ULL	/* SOC-DEV-DVFS + 4: macOS writes 1 << 61 */
+
+
+/* macOS 15.6.1 j314s MMIO writes between MBSE=slpa and the CPU power-down, in order (hv trace). */
+static const struct { u64 addr; u8 width; u64 val; } lab_post_slpa[] = {
+	{ 0x2922b000cULL, 4, 0x0ULL },	/* wdt[0]+0x0c */
+	{ 0x282000a00ULL, 4, 0x0ULL },	/* error-handler[7]+0xa00 */
+	{ 0x304000a00ULL, 4, 0x0ULL },	/* error-handler[8]+0xa00 */
+	{ 0x383000a00ULL, 4, 0x0ULL },	/* error-handler[9]+0xa00 */
+	{ 0x402000a00ULL, 4, 0x0ULL },	/* error-handler[10]+0xa00 */
+	{ 0x28e0ad000ULL, 4, 0x0ULL },	/* error-handler[2]+0x2d000 */
+	{ 0x28e0f8000ULL, 4, 0x0ULL },	/* error-handler[2]+0x78000 */
+	{ 0x28e0f9000ULL, 4, 0x0ULL },	/* error-handler[2]+0x79000 */
+	{ 0x28e0fa000ULL, 4, 0x0ULL },	/* error-handler[2]+0x7a000 */
+	{ 0x28e0fb000ULL, 4, 0x0ULL },	/* error-handler[2]+0x7b000 */
+	{ 0x28e0fc000ULL, 4, 0x0ULL },	/* error-handler[2]+0x7c000 */
+	{ 0x28e0fd000ULL, 4, 0x0ULL },	/* error-handler[2]+0x7d000 */
+	{ 0x28e070000ULL, 4, 0x0ULL },	/* error-handler[1]+0x70000 */
+	{ 0x28e5d8000ULL, 4, 0x0ULL },	/* pmgr[2]+0x58000 */
+	{ 0x210e20660ULL, 8, 0x0ULL },	/* pmgr[8]+0x660 */
+	{ 0x210e48080ULL, 8, 0x0ULL },	/* pmgr[10]+0x8080 */
+	{ 0x211e20660ULL, 8, 0x0ULL },	/* pmgr[15]+0x660 */
+	{ 0x211e48080ULL, 8, 0x0ULL },	/* pmgr[17]+0x8080 */
+	{ 0x212e20660ULL, 8, 0x0ULL },	/* pmgr[24]+0x660 */
+	{ 0x212e48080ULL, 8, 0x0ULL },	/* pmgr[26]+0x8080 */
+	{ 0x58c008014ULL, 4, 0x1ULL },	/* pmgr[56]+0x8014 */
+	{ 0x58c0082bcULL, 4, 0x1ULL },	/* pmgr[56]+0x82bc */
+	{ 0x58c0082bcULL, 4, 0x2ULL },	/* pmgr[56]+0x82bc */
+	{ 0x58c0082bcULL, 4, 0x4ULL },	/* pmgr[56]+0x82bc */
+	{ 0x210e20020ULL, 8, 0x100101ULL },	/* pmgr[8]+0x20 */
+	{ 0x211e20020ULL, 8, 0x100101ULL },	/* pmgr[15]+0x20 */
+	{ 0x210e40250ULL, 8, 0xff092df01000ULL },	/* pmgr[10]+0x250 */
+	{ 0x211e40250ULL, 8, 0x10ff092df01000ULL },	/* pmgr[17]+0x250 */
+	{ 0x212e40250ULL, 8, 0x10ff092df01000ULL },	/* pmgr[26]+0x250 */
+	{ 0x210e40240ULL, 8, 0x10000000ULL },	/* pmgr[10]+0x240 */
+	{ 0x211e40240ULL, 8, 0x10000000ULL },	/* pmgr[17]+0x240 */
+	{ 0x212e40240ULL, 8, 0x10000000ULL },	/* pmgr[26]+0x240 */
+	{ 0x210e48400ULL, 8, 0x5b2002df02000ULL },	/* pmgr[10]+0x8400 */
+	{ 0x211e48400ULL, 8, 0x5b2005df05200ULL },	/* pmgr[17]+0x8400 */
+	{ 0x212e48400ULL, 8, 0x5b2005df05200ULL },	/* pmgr[26]+0x8400 */
+	{ 0x28e5e0000ULL, 4, 0x0ULL },	/* pmgr[2]+0x60000 */
+	{ 0x28e5e4000ULL, 4, 0x0ULL },	/* pmgr[2]+0x64000 */
+	{ 0x28e0c8200ULL, 4, 0x0ULL },	/* error-handler[2]+0x48200 */
+	{ 0x28e0c8400ULL, 4, 0x0ULL },	/* error-handler[2]+0x48400 */
+	{ 0x28e0c8600ULL, 4, 0x0ULL },	/* error-handler[2]+0x48600 */
+	{ 0x28e0c8000ULL, 4, 0x0ULL },	/* error-handler[2]+0x48000 */
+	{ 0x210e20020ULL, 8, 0x40000500101ULL },	/* pmgr[8]+0x20 */
+	{ 0x211e20020ULL, 8, 0x40000500101ULL },	/* pmgr[15]+0x20 */
+	{ 0x212e20020ULL, 8, 0x40000500101ULL },	/* pmgr[24]+0x20 */
+	{ 0x210e20020ULL, 8, 0x40000500101ULL },	/* pmgr[8]+0x20 */
+	{ 0x211e20020ULL, 8, 0x40000500101ULL },	/* pmgr[15]+0x20 */
+	{ 0x212e20020ULL, 8, 0x40000500101ULL },	/* pmgr[24]+0x20 */
+	{ 0x28e20c800ULL, 4, 0x557ULL },	/* pmgr[38]+0x800 */
+	{ 0x28e20c800ULL, 4, 0x775ULL },	/* pmgr[38]+0x800 */
+	{ 0x28e0801e8ULL, 4, 0x0ULL },	/* error-handler[2]+0x1e8 */
+	{ 0x28e098000ULL, 4, 0x0ULL },	/* error-handler[2]+0x18000 */
+	{ 0x28e098004ULL, 4, 0x20ULL },	/* error-handler[2]+0x18004 */
+	{ 0x28e098008ULL, 4, 0x20ULL },	/* error-handler[2]+0x18008 */
+	{ 0x28e09800cULL, 4, 0x0ULL },	/* error-handler[2]+0x1800c */
+	{ 0x28e5e4000ULL, 4, 0x0ULL },	/* pmgr[2]+0x64000 */
+	{ 0x28e098014ULL, 4, 0x0ULL },	/* error-handler[2]+0x18014 */
+	{ 0x28e098018ULL, 4, 0x20ULL },	/* error-handler[2]+0x18018 */
+	{ 0x28e0c8400ULL, 4, 0x0ULL },	/* error-handler[2]+0x48400 */
+	{ 0x28e098020ULL, 4, 0x0ULL },	/* error-handler[2]+0x18020 */
+	{ 0x28e580188ULL, 4, 0x400024fULL },	/* pmgr[2]+0x188 */
+	{ 0x28e038164ULL, 4, 0x80100000ULL },	/* error-handler[1]+0x38164 */
+	{ 0x28e03816cULL, 4, 0x80100000ULL },	/* error-handler[1]+0x3816c */
+	{ 0x28e038168ULL, 4, 0x80100000ULL },	/* error-handler[1]+0x38168 */
+	{ 0x28e03815cULL, 4, 0x80100000ULL },	/* error-handler[1]+0x3815c */
+	{ 0x28e038170ULL, 4, 0x80100000ULL },	/* error-handler[1]+0x38170 */
+	{ 0x28e224000ULL, 4, 0x219ULL },	/* pmgr[46]+0x00 */
+	{ 0x28e224000ULL, 4, 0x21bULL },	/* pmgr[46]+0x00 */
+	{ 0x28e224000ULL, 4, 0x8000021aULL },	/* pmgr[46]+0x00 */
+	{ 0x28e224000ULL, 4, 0x21aULL },	/* pmgr[46]+0x00 */
+	{ 0x28e224000ULL, 4, 0x21aULL },	/* pmgr[46]+0x00 */
+	{ 0x28e224000ULL, 4, 0x21aULL },	/* pmgr[46]+0x00 */
+	{ 0x2925c4000ULL, 4, 0x1ULL },	/* pmgr[36]+0x4000 */
+};
+
+static void lab_replay_post_slpa(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(lab_post_slpa); i++) {
+		void __iomem *p = ioremap(lab_post_slpa[i].addr & PAGE_MASK, PAGE_SIZE);
+
+		if (!p)
+			continue;
+		p += lab_post_slpa[i].addr & ~PAGE_MASK;
+		if (lab_post_slpa[i].width == 8)
+			writeq(lab_post_slpa[i].val, p);
+		else
+			writel(lab_post_slpa[i].val, p);
+	}
+}
 
 static void lab_floor_cpu(void *unused)
 {
@@ -267,6 +362,12 @@ static int lab_s2r_prepare_late(void)
 	if (lab_s2r_floor & 1) {
 		ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpa));
 		pr_emerg("lab_s2r_floor: MBSE=slpa %d\n", ret);
+	}
+	if (lab_s2r_floor & 8) {
+		pr_emerg("lab_s2r_floor: replaying %zu post-slpa writes\n", ARRAY_SIZE(lab_post_slpa));
+		mdelay(50);
+		lab_replay_post_slpa();
+		pr_emerg("lab_s2r_floor: post-slpa replay done\n");
 	}
 	if (lab_s2r_floor & 2) {
 		pr_emerg("lab_s2r_floor: powering down all CPUs, no return\n");
