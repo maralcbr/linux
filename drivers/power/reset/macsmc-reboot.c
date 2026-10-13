@@ -208,12 +208,12 @@ static void macsmc_power_init_error_counts(struct macsmc_reboot *reboot)
  * LAB ONLY: one-way replay of the sleep-entry sequence macOS 15.6.1 runs on
  * j314s (traced under the m1n1 hypervisor), to measure the power floor Linux
  * reaches once every CPU is powered down. There is no resume path: the Mac
- * stays asleep until the lab's out-of-band reset. bit0 = SMC/PMGR sequence,
- * bit1 = CPU power-down.
+ * stays asleep until the lab's out-of-band reset. bit0 = SMC keys,
+ * bit1 = CPU power-down, bit2 = PMGR/PMP register writes.
  */
 static unsigned int lab_s2r_floor;
 module_param(lab_s2r_floor, uint, 0644);
-MODULE_PARM_DESC(lab_s2r_floor, "LAB ONLY: replay macOS sleep entry at s2idle prepare_late and never return (bit0 SMC/PMGR, bit1 CPU power-down)");
+MODULE_PARM_DESC(lab_s2r_floor, "LAB ONLY: replay macOS sleep entry at s2idle prepare_late and never return (bit0 SMC keys, bit1 CPU power-down, bit2 PMGR/PMP writes)");
 
 static struct macsmc_reboot *lab_reboot;
 
@@ -250,16 +250,21 @@ static int lab_s2r_prepare_late(void)
 	if (!req || !dvfs)
 		return 0;
 
-	if (lab_s2r_floor & 1) {
+	if (lab_s2r_floor & 4)
 		writel(4, req + (LAB_PMGR_SLEEP_REQ & ~PAGE_MASK));
+	if (lab_s2r_floor & 1) {
 		ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpw));
 		pr_emerg("lab_s2r_floor: MBSE=slpw %d\n", ret);
 		ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), 0x100);
 		pr_emerg("lab_s2r_floor: pmVC=0x100 %d\n", ret);
 		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), 2);
 		pr_emerg("lab_s2r_floor: WKTP=2 %d\n", ret);
+	}
+	if (lab_s2r_floor & 4) {
 		writeq(1ULL << 61, dvfs + (LAB_PMP_DVFS4 & ~PAGE_MASK));
 		writel(1, req + (LAB_PMGR_SLEEP_REQ & ~PAGE_MASK));
+	}
+	if (lab_s2r_floor & 1) {
 		ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpa));
 		pr_emerg("lab_s2r_floor: MBSE=slpa %d\n", ret);
 	}
