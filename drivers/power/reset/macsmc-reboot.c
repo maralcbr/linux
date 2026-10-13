@@ -210,7 +210,8 @@ static void macsmc_power_init_error_counts(struct macsmc_reboot *reboot)
  * reaches once every CPU is powered down. There is no resume path: the Mac
  * stays asleep until the lab's out-of-band reset. bit0 = SMC keys,
  * bit1 = CPU power-down, bit2 = PMGR/PMP register writes, bit3 = the
- * post-slpa PMGR/watchdog/error-handler writes.
+ * post-slpa PMGR/watchdog/error-handler writes, bit4 = run from s2idle
+ * prepare (before noirq, PM domains still on) instead of prepare_late.
  */
 static unsigned int lab_s2r_floor;
 module_param(lab_s2r_floor, uint, 0644);
@@ -414,7 +415,19 @@ static void lab_floor_cpu(void *unused)
 		asm volatile("dsb sy; wfi");
 }
 
+static int lab_s2r_run(void);
+
+static int lab_s2r_prepare(void)
+{
+	return (lab_s2r_floor & 16) ? lab_s2r_run() : 0;
+}
+
 static int lab_s2r_prepare_late(void)
+{
+	return (lab_s2r_floor & 16) ? 0 : lab_s2r_run();
+}
+
+static int lab_s2r_run(void)
 {
 	struct apple_smc *smc = lab_reboot->smc;
 	void __iomem *req, *dvfs;
@@ -490,6 +503,7 @@ static int lab_s2r_prepare_late(void)
 }
 
 static const struct platform_s2idle_ops lab_s2r_ops = {
+	.prepare = lab_s2r_prepare,
 	.prepare_late = lab_s2r_prepare_late,
 };
 
