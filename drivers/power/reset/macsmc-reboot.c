@@ -212,7 +212,7 @@ static void macsmc_power_init_error_counts(struct macsmc_reboot *reboot)
  * bit1 = CPU power-down, bit2 = PMGR/PMP register writes, bit3 = the
  * post-slpa PMGR/watchdog/error-handler writes, bit4 = run from s2idle
  * prepare instead of prepare_late, bit5 = disable all three SoC watchdog channels, bit6 = tell the AOP the AP is idle before slpa, bit7 = dump every PMGR power-state register before slpa, bits 8-10 = switch
- * off the domains macOS has off (8 devices/display/ATC, 9 PMP, 10 SEP).
+ * off the domains macOS has off (8 devices/display/ATC, 9 PMP, 10 SEP), bit 11 = SEP sleep message.
  */
 static unsigned int lab_s2r_floor;
 module_param(lab_s2r_floor, uint, 0644);
@@ -569,6 +569,39 @@ static void lab_ps_switch_off(unsigned int grpmask)
 	pr_emerg("lab_s2r_floor: switched off PMGR domains (groups %x)\n", grpmask);
 }
 
+
+/* LAB ONLY: macOS's SEP sleep message (control endpoint 0, opcode 0x0c, param 2), traced under the hv. */
+#define LAB_SEP_MBOX		0x396408000ULL
+static void lab_sep_sleep(void)
+{
+	void __iomem *m = ioremap_np(LAB_SEP_MBOX, 0x1000);
+	u64 r0 = 0, r1 = 0;
+	int i, drained = 0;
+
+	if (!m)
+		return;
+	while (!(readl(m + 0x114) & BIT(17)) && drained < 16) {	/* I2A not empty: drain */
+		r0 = readq(m + 0x830);
+		r1 = readq(m + 0x838);
+		pr_emerg("lab_sep: drained %016llx %016llx\n", r0, r1);
+		drained++;
+	}
+	for (i = 0; i < 100 && (readl(m + 0x110) & BIT(16)); i++)	/* A2I full */
+		mdelay(1);
+	writeq_relaxed(0x00000000020c0700ULL, m + 0x800);
+	writeq(0, m + 0x808);
+	for (i = 0; i < 500; i++) {
+		if (!(readl(m + 0x114) & BIT(17))) {
+			r0 = readq(m + 0x830);
+			r1 = readq(m + 0x838);
+			break;
+		}
+		mdelay(1);
+	}
+	pr_emerg("lab_sep: sleep sent, reply after %d ms: %016llx %016llx (macOS: 0000000000010700)\n", i, r0, r1);
+	iounmap(m);
+}
+
 static void lab_dump_wdt(const char *when)
 {
 	void __iomem *w = ioremap_np(0x2922b0000ULL, 0x40);
@@ -639,6 +672,8 @@ static int lab_s2r_run(void)
 		writeq(1ULL << 61, dvfs + (LAB_PMP_DVFS4 & ~PAGE_MASK));
 		writel(1, req + (LAB_PMGR_SLEEP_REQ & ~PAGE_MASK));
 	}
+	if (lab_s2r_floor & 2048)
+		lab_sep_sleep();
 	if (lab_s2r_floor & (256 | 512 | 1024))
 		lab_ps_switch_off(((lab_s2r_floor >> 8) & 7));
 	if (lab_s2r_floor & 128)
