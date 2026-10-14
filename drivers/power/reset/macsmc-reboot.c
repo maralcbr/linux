@@ -441,6 +441,8 @@ static void lab_floor_cpu(void *unused)
 	acc |= BIT_ULL(13) | (3ULL << 17) | (3ULL << 25) | BIT_ULL(32) | BIT_ULL(34);
 	asm volatile("msr s3_5_c15_c6_0, %0" :: "r"(acc));
 	asm volatile("mrs %0, s3_5_c15_c5_0" : "=r"(cyc));
+	/* macOS writes exactly 0x3000001: FIQ/IRQ mode 0, WFI mode 3, WFI retention off */
+	cyc &= ~(GENMASK_ULL(25, 20) | BIT_ULL(0));
 	cyc |= 0x3000001ULL;
 	asm volatile("msr s3_5_c15_c5_0, %0; isb" :: "r"(cyc));
 	for (;;)
