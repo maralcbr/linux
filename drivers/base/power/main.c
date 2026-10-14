@@ -493,6 +493,9 @@ static void dpm_show_time(ktime_t starttime, pm_message_t state, int error,
 		  usecs / USEC_PER_MSEC, usecs % USEC_PER_MSEC);
 }
 
+/* LAB ONLY: macsmc-reboot watches a PMGR register across PM callbacks. */
+void __weak lab_pm_cb_hook(struct device *dev, const char *info) { }
+
 static int dpm_run_callback(pm_callback_t cb, struct device *dev,
 			    pm_message_t state, const char *info)
 {
@@ -507,6 +510,7 @@ static int dpm_run_callback(pm_callback_t cb, struct device *dev,
 	pm_dev_dbg(dev, state, info);
 	trace_device_pm_callback_start(dev, info, state.event);
 	error = cb(dev);
+	lab_pm_cb_hook(dev, info);
 	trace_device_pm_callback_end(dev, error);
 	suspend_report_result(dev, cb, error);
 

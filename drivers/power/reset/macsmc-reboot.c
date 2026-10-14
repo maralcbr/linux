@@ -458,10 +458,32 @@ static void lab_floor_cpu(void *unused)
 
 static int lab_s2r_run(void);
 
+static void __iomem *lab_hook_map;
+static u32 lab_hook_last;
+
+/* LAB ONLY: report which PM callback changes afnc2/afnc3 */
+void lab_pm_cb_hook(struct device *dev, const char *info)
+{
+	u32 v;
+
+	if (!lab_s2r_floor || !lab_hook_map)
+		return;
+	v = (readl(lab_hook_map + 0x178) & 0xff) | ((readl(lab_hook_map + 0x160) & 0xff) << 8);
+	if (v != lab_hook_last) {
+		pr_emerg("lab_hook: %s %s: afnc2 %02x->%02x afnc3 %02x->%02x\n", info, dev_name(dev),
+			 (lab_hook_last >> 8) & 0xff, (v >> 8) & 0xff, lab_hook_last & 0xff, v & 0xff);
+		lab_hook_last = v;
+	}
+}
+
 static void lab_afnc(const char *tag);
 static int lab_s2r_prepare(void)
 {
 	lab_afnc("s2idle-prepare(before suspend_late/noirq)");
+	if (!lab_hook_map)
+		lab_hook_map = ioremap_np(0x28e580000ULL, PAGE_SIZE);
+	if (lab_hook_map)
+		lab_hook_last = (readl(lab_hook_map + 0x178) & 0xff) | ((readl(lab_hook_map + 0x160) & 0xff) << 8);
 	return (lab_s2r_floor & 16) ? lab_s2r_run() : 0;
 }
 
