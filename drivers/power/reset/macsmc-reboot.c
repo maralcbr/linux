@@ -601,13 +601,6 @@ static void lab_pcie_ports_down(void)
 
 		if (!rc)
 			return;
-		pr_emerg("lab_pcie: rc phyif %08x ctl %08x fabric %08x\n",
-			 readl(rc + 0x24), readl(rc + 0x50), readl(rc + 0x4000));
-		writel(readl(rc + 0x50) & ~BIT(0), rc + 0x50);
-		writel(readl(rc + 0x24) & ~BIT(0), rc + 0x24);
-		udelay(100);
-		pr_emerg("lab_pcie: rc stopped: phyif %08x/%08x ctl %08x stat %08x\n",
-			 readl(rc + 0x24), readl(rc + 0x28), readl(rc + 0x50), readl(rc + 0x58));
 		for (n = 0; n < 4; n++)
 			lc[n] = readl(rc + 0x84000 + 0x4000 * n);
 		/* no RC reads after this: the core loses its clock */
