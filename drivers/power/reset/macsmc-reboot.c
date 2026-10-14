@@ -803,10 +803,16 @@ static int lab_s2r_run(void)
 	if ((lab_s2r_floor & 8) && lab_post_fast) {
 		lab_replay_post_slpa_fast();
 		if (lab_afnc_map) {
-			mdelay(5);
-			pr_emerg("lab_post: afnc2 %08x afnc3 %08x sio %08x sep %08x\n",
-				 readl(lab_afnc_map + 0x160), readl(lab_afnc_map + 0x178),
-				 readl(lab_afnc_map + 0x180), readl(lab_afnc_map + 0xc00));
+			u32 a2, a3, b2, b3;
+
+			mdelay(100);
+			a2 = readl(lab_afnc_map + 0x160);
+			a3 = readl(lab_afnc_map + 0x178);
+			mdelay(400);
+			b2 = readl(lab_afnc_map + 0x160);
+			b3 = readl(lab_afnc_map + 0x178);
+			pr_emerg("lab_post: quiet +100ms afnc2 %08x afnc3 %08x, +500ms afnc2 %08x afnc3 %08x\n",
+				 a2, a3, b2, b3);
 		}
 		if (lab_s2r_floor & 2) {
 			smp_call_function(lab_floor_cpu, NULL, 0);
