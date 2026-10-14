@@ -225,6 +225,7 @@ MODULE_PARM_DESC(lab_delay_stage, "LAB ONLY: 10 s delay before slpw (1), between
 
 static struct macsmc_reboot *lab_reboot;
 int lab_rtkit_aop_ap_idle(void);
+int lab_rtkit_aop_sleep_notify(void);
 int lab_rtkit_ans_shutdown(void);
 
 #define LAB_PMGR_SLEEP_REQ	0x28e3d8328ULL	/* PMGR reg 41 + 0x18328: macOS writes 4, later 1 */
@@ -846,6 +847,8 @@ static int lab_s2r_run(void)
 	lab_afnc("after-slpw-keys-pmp-sep");
 	LAB_DELAY(2);
 	if (lab_s2r_floor & 64) {
+		ret = lab_rtkit_aop_sleep_notify();
+		pr_emerg("lab_s2r_floor: AOP sleep notifications sent %d\n", ret);
 		ret = lab_rtkit_aop_ap_idle();
 		pr_emerg("lab_s2r_floor: AOP SetAPPower(IDLE) %d\n", ret);
 	}

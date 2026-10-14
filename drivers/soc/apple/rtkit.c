@@ -1178,6 +1178,29 @@ int lab_rtkit_aop_ap_idle(void)
 }
 EXPORT_SYMBOL_GPL(lab_rtkit_aop_ap_idle);
 
+/*
+ * LAB ONLY: macOS's AOP sleep notification (hv trace): 0x00a4000000000000 to
+ * endpoints 0x2b, 0x29, 0x2a, 0x23, each answered with 0x0087..., before
+ * SetAPPower(0x201).
+ */
+int lab_rtkit_aop_sleep_notify(void)
+{
+	static const u8 eps[] = { 0x2b, 0x29, 0x2a, 0x23 };
+	int i, ret, sent = 0;
+
+	if (!lab_aop_rtk)
+		return -ENODEV;
+	for (i = 0; i < ARRAY_SIZE(eps); i++) {
+		ret = apple_rtkit_send_message(lab_aop_rtk, eps[i], 0x00a4000000000000ULL, NULL, false);
+		dev_info(lab_aop_rtk->dev, "lab: sleep notification to ep 0x%02x: %d\n", eps[i], ret);
+		if (!ret)
+			sent++;
+		msleep(20);
+	}
+	return sent;
+}
+EXPORT_SYMBOL_GPL(lab_rtkit_aop_sleep_notify);
+
 /* LAB ONLY: shut the ANS (NVMe) coprocessor down as macOS does at sleep; Linux's s2idle leaves it running. */
 int lab_rtkit_ans_shutdown(void)
 {
