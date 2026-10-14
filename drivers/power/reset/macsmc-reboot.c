@@ -572,6 +572,35 @@ static void lab_ps_switch_off(unsigned int grpmask)
 
 /* LAB ONLY: macOS's SEP sleep message (control endpoint 0, opcode 0x0c, param 2), traced under the hv. */
 #define LAB_SEP_MBOX		0x396408000ULL
+/* LAB ONLY: force the PCIe/fabric domains macOS has gated to target 0, children first. */
+static void lab_force_fabric_off(void)
+{
+	static const struct { u64 addr; const char *name; } fab[] = {
+		{ 0x28e080138ULL, "PCIE0_REF" },
+		{ 0x28e080320ULL, "APCIE_GP_SYS" },
+		{ 0x28e080220ULL, "AFNC1_LW2" },
+		{ 0x28e580160ULL, "AFNC2_LW1" },
+		{ 0x28e580178ULL, "AFNC3_LW0" },
+	};
+	int i, t;
+
+	for (i = 0; i < ARRAY_SIZE(fab); i++) {
+		void __iomem *p = ioremap_np(fab[i].addr & PAGE_MASK, PAGE_SIZE);
+		void __iomem *r;
+		u32 before;
+
+		if (!p)
+			continue;
+		r = p + (fab[i].addr & ~PAGE_MASK);
+		before = readl(r);
+		writel(before & ~0xfU, r);
+		for (t = 0; t < 20 && (readl(r) & 0xf0); t++)
+			mdelay(1);
+		pr_emerg("lab_fabric: %s %08x -> %08x after %d ms\n", fab[i].name, before, readl(r), t);
+		iounmap(p);
+	}
+}
+
 extern int lab_sep_sleep_request(void) __weak;
 static void lab_sep_sleep(void)
 {
@@ -705,6 +734,8 @@ static int lab_s2r_run(void)
 		lab_sep_sleep();
 	if (lab_s2r_floor & (256 | 512 | 1024))
 		lab_ps_switch_off(((lab_s2r_floor >> 8) & 7));
+	if (lab_s2r_floor & 4096)
+		lab_force_fabric_off();
 	if (lab_s2r_floor & 128)
 		lab_dump_ps("before-slpa");
 	if (lab_s2r_floor & 64) {
