@@ -227,6 +227,8 @@ int lab_rtkit_aop_ap_idle(void);
 
 /* macOS 15.6.1 j314s MMIO writes between MBSE=slpa and the CPU power-down, in order (hv trace). */
 static const struct { u64 addr; u8 width; u64 val; } lab_post_slpa[] = {
+	{ 0x580080000ULL, 4, 0x8fULL },	/* apcie[2]+0x00 */
+	{ 0x580080000ULL, 4, 0x8cULL },	/* apcie[2]+0x00 */
 	{ 0x2922b000cULL, 4, 0x0ULL },	/* wdt[0]+0x0c */
 	{ 0x282000a00ULL, 4, 0x0ULL },	/* error-handler[7]+0xa00 */
 	{ 0x304000a00ULL, 4, 0x0ULL },	/* error-handler[8]+0xa00 */
@@ -572,43 +574,51 @@ static void lab_ps_switch_off(unsigned int grpmask)
 
 /* LAB ONLY: macOS's SEP sleep message (control endpoint 0, opcode 0x0c, param 2), traced under the hv. */
 #define LAB_SEP_MBOX		0x396408000ULL
-/* LAB ONLY: internal PCIe ports 0-3 (0x581000000 + n * 0x1000000): app clock off, PERST asserted, refclk off. */
+/* LAB ONLY: macOS's internal-PCIe port power-down between slpw and slpa (hv trace), for ports with PERST released. */
 static void lab_pcie_ports_down(void)
 {
+	void __iomem *rc = ioremap_np(0x580000000ULL, 0x100000);
 	int n;
 
+	if (!rc)
+		return;
 	for (n = 0; n < 4; n++) {
 		void __iomem *p = ioremap_np(0x581000000ULL + n * 0x1000000ULL, 0x4000);
-		u32 a, r, s;
+		void __iomem *phy = rc + 0x84000 + 0x4000 * n;
+		u32 perst, a, r, lc;
 
 		if (!p)
 			continue;
+		perst = readl(p + 0x814);
 		a = readl(p + 0x800);
 		r = readl(p + 0x810);
-		s = readl(p + 0x814);
-		writel(a & ~BIT(0), p + 0x800);
-		writel(s & ~BIT(0), p + 0x814);
-		udelay(100);
-		writel(r & ~(BIT(0) | BIT(8)), p + 0x810);
-		writel(readl(p + 0x800) & ~BIT(8), p + 0x800);
-		pr_emerg("lab_pcie: port%d appclk %08x->%08x refclk %08x->%08x perst %08x->%08x status %08x\n",
-			 n, a, readl(p + 0x800), r, readl(p + 0x810), s, readl(p + 0x814), readl(p + 0x804));
+		lc = readl(phy);
+		if (!(perst & BIT(0))) {
+			pr_emerg("lab_pcie: port%d already in reset (appclk %08x refclk %08x lane %08x)\n", n, a, r, lc);
+			iounmap(p);
+			continue;
+		}
+		writel(0xf0, p + 0x108);
+		writel(0xf0, p + 0x100);
+		writel(r | BIT(8), p + 0x810);
+		writel(a | BIT(8), p + 0x800);
+		writel(0x11, p + 0x8c);
+		mdelay(1);
+		writel(r | BIT(8), p + 0x810);
+		writel(readl(p + 0x13c) | BIT(8), p + 0x13c);
+		writel(perst & ~BIT(0), p + 0x814);
+		writel(readl(p + 0x13c) & ~BIT(8), p + 0x13c);
+		writel((r | BIT(8)) & ~BIT(0), p + 0x810);
+		writel(readl(phy + 4) | BIT(15), phy + 4);
+		writel(lc & ~(BIT(0) | BIT(1)), phy);
+		writel((a | BIT(8)) & ~BIT(0), p + 0x800);
+		writel(0x4600, p + 0x100);
+		pr_emerg("lab_pcie: port%d down: appclk %08x->%08x refclk %08x->%08x lane %08x->%08x 8c %08x 13c %08x\n",
+			 n, a, readl(p + 0x800), r, readl(p + 0x810), lc, readl(phy), readl(p + 0x8c), readl(p + 0x13c));
 		iounmap(p);
 	}
-	{
-		void __iomem *rc = ioremap_np(0x580000000ULL, 0x100000);
-		u32 lc[4];
-
-		if (!rc)
-			return;
-		for (n = 0; n < 4; n++)
-			lc[n] = readl(rc + 0x84000 + 0x4000 * n);
-		/* no RC reads after this: the core loses its clock */
-		for (n = 0; n < 4; n++)
-			writel(lc[n] & ~(BIT(0) | BIT(1) | BIT(9) | BIT(10)), rc + 0x84000 + 0x4000 * n);
-		pr_emerg("lab_pcie: lane cfg %08x %08x %08x %08x released\n", lc[0], lc[1], lc[2], lc[3]);
-		iounmap(rc);
-	}
+	pr_emerg("lab_pcie: apcie[2]+0 %08x\n", readl(rc + 0x80000));
+	iounmap(rc);
 }
 
 /* LAB ONLY: force the PCIe/fabric domains macOS has gated to target 0, children first. */
