@@ -579,8 +579,27 @@ static void lab_sep_sleep(void)
 		int rc = lab_sep_sleep_request();
 
 		pr_emerg("lab_sep: sleep via apple_sep: %d\n", rc);
-		if (rc != -ENODEV)
+		if (rc != -ENODEV) {
+			void __iomem *mb = ioremap_np(LAB_SEP_MBOX, 0x1000);
+			void __iomem *ps = ioremap_np(0x28e580000ULL, 0x1000);
+			int t;
+
+			if (mb && ps) {
+				/* macOS: OUTBOX_CTRL ENABLE=0 after the ack (0x28801 -> 0x21100) */
+				writel(readl(mb + 0x114) & ~BIT(0), mb + 0x114);
+				pr_emerg("lab_sep: outbox ctrl %08x, sep ps %08x\n", readl(mb + 0x114), readl(ps + 0xc00));
+				writel(0x1000030f, ps + 0xc00);
+				for (t = 0; t <= 100; t += 10) {
+					pr_emerg("lab_sep: +%dms sep ps %08x\n", t, readl(ps + 0xc00));
+					mdelay(10);
+				}
+			}
+			if (mb)
+				iounmap(mb);
+			if (ps)
+				iounmap(ps);
 			return;
+		}
 	}
 	{
 	void __iomem *m = ioremap_np(LAB_SEP_MBOX, 0x1000);
