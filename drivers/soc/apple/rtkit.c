@@ -8,6 +8,7 @@
 
 /* LAB ONLY: the AOP's RTKit instance, so the sleep experiments can set its AP power state. */
 static struct apple_rtkit *lab_aop_rtk;
+static struct apple_rtkit *lab_ans_rtk;
 
 enum {
 	APPLE_RTKIT_PWR_STATE_OFF = 0x00, /* power off, cannot be restarted */
@@ -889,6 +890,8 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->dev = dev;
 	if (strstr(dev_name(dev), "aop"))
 		lab_aop_rtk = rtk;
+	if (strstr(dev_name(dev), "nvme"))
+		lab_ans_rtk = rtk;
 	rtk->cookie = cookie;
 	rtk->ops = ops;
 
@@ -1174,6 +1177,17 @@ int lab_rtkit_aop_ap_idle(void)
 	return apple_rtkit_set_ap_power_state(lab_aop_rtk, APPLE_RTKIT_PWR_STATE_IDLE);
 }
 EXPORT_SYMBOL_GPL(lab_rtkit_aop_ap_idle);
+
+/* LAB ONLY: shut the ANS (NVMe) coprocessor down as macOS does at sleep; Linux's s2idle leaves it running. */
+int lab_rtkit_ans_shutdown(void)
+{
+	if (!lab_ans_rtk)
+		return -ENODEV;
+	if (!apple_rtkit_is_running(lab_ans_rtk))
+		return -EALREADY;
+	return apple_rtkit_shutdown(lab_ans_rtk);
+}
+EXPORT_SYMBOL_GPL(lab_rtkit_ans_shutdown);
 
 int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 {

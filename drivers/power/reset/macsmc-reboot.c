@@ -220,6 +220,7 @@ MODULE_PARM_DESC(lab_s2r_floor, "LAB ONLY: replay macOS sleep entry at s2idle pr
 
 static struct macsmc_reboot *lab_reboot;
 int lab_rtkit_aop_ap_idle(void);
+int lab_rtkit_ans_shutdown(void);
 
 #define LAB_PMGR_SLEEP_REQ	0x28e3d8328ULL	/* PMGR reg 41 + 0x18328: macOS writes 4, later 1 */
 #define LAB_PMP_DVFS4		0x28e3d0860ULL	/* SOC-DEV-DVFS + 4: macOS writes 1 << 61 */
@@ -768,6 +769,10 @@ static int lab_s2r_run(void)
 			dsb(sy);
 			pr_emerg("lab_s2r_floor: error handlers masked before the handshake\n");
 		}
+	}
+	if (lab_s2r_floor & 16384) {
+		ret = lab_rtkit_ans_shutdown();
+		pr_emerg("lab_s2r_floor: ANS RTKit shutdown %d\n", ret);
 	}
 	if (lab_s2r_floor & 4)
 		writel(4, req + (LAB_PMGR_SLEEP_REQ & ~PAGE_MASK));
