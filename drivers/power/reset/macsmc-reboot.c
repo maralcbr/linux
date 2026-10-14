@@ -572,6 +572,31 @@ static void lab_ps_switch_off(unsigned int grpmask)
 
 /* LAB ONLY: macOS's SEP sleep message (control endpoint 0, opcode 0x0c, param 2), traced under the hv. */
 #define LAB_SEP_MBOX		0x396408000ULL
+/* LAB ONLY: internal PCIe ports 0-3 (0x581000000 + n * 0x1000000): app clock off, PERST asserted, refclk off. */
+static void lab_pcie_ports_down(void)
+{
+	int n;
+
+	for (n = 0; n < 4; n++) {
+		void __iomem *p = ioremap_np(0x581000000ULL + n * 0x1000000ULL, 0x4000);
+		u32 a, r, s;
+
+		if (!p)
+			continue;
+		a = readl(p + 0x800);
+		r = readl(p + 0x810);
+		s = readl(p + 0x814);
+		writel(a & ~BIT(0), p + 0x800);
+		writel(s & ~BIT(0), p + 0x814);
+		udelay(100);
+		writel(r & ~(BIT(0) | BIT(8)), p + 0x810);
+		writel(readl(p + 0x800) & ~BIT(8), p + 0x800);
+		pr_emerg("lab_pcie: port%d appclk %08x->%08x refclk %08x->%08x perst %08x->%08x status %08x\n",
+			 n, a, readl(p + 0x800), r, readl(p + 0x810), s, readl(p + 0x814), readl(p + 0x804));
+		iounmap(p);
+	}
+}
+
 /* LAB ONLY: force the PCIe/fabric domains macOS has gated to target 0, children first. */
 static void lab_force_fabric_off(void)
 {
@@ -734,6 +759,8 @@ static int lab_s2r_run(void)
 		lab_sep_sleep();
 	if (lab_s2r_floor & (256 | 512 | 1024))
 		lab_ps_switch_off(((lab_s2r_floor >> 8) & 7));
+	if (lab_s2r_floor & 8192)
+		lab_pcie_ports_down();
 	if (lab_s2r_floor & 4096)
 		lab_force_fabric_off();
 	if (lab_s2r_floor & 128)
