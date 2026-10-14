@@ -218,6 +218,11 @@ static unsigned int lab_s2r_floor;
 module_param(lab_s2r_floor, uint, 0644);
 MODULE_PARM_DESC(lab_s2r_floor, "LAB ONLY: replay macOS sleep entry at s2idle prepare_late and never return (bit0 SMC keys, bit1 CPU power-down, bit2 PMGR/PMP writes)");
 
+static int lab_delay_stage;
+module_param(lab_delay_stage, int, 0644);
+MODULE_PARM_DESC(lab_delay_stage, "LAB ONLY: 10 s delay before slpw (1), between slpw and slpa (2), or after the post-slpa writes (3)");
+#define LAB_DELAY(n) do { if (lab_delay_stage == (n)) { pr_emerg("lab_delay: stage %d 10 s\n", (n)); mdelay(10000); } } while (0)
+
 static struct macsmc_reboot *lab_reboot;
 int lab_rtkit_aop_ap_idle(void);
 int lab_rtkit_ans_shutdown(void);
@@ -438,8 +443,9 @@ static void lab_floor_cpu(void *unused)
 
 	local_daif_mask();
 	asm volatile("mrs %0, s3_5_c15_c6_0" : "=r"(acc));
+	/* m1n1 cpu_sleep(deep): PWR_DN_SRM(3) DIS_L2_FLUSH_ACC_SLEEP(2) TRAIN_DOWN_LINK(3) POWER_DOWN_CPM(3) DISABLE_PIO_ON_WFI_CPU DEEP_SLEEP */
 	acc &= ~(GENMASK_ULL(18, 13) | GENMASK_ULL(26, 25));
-	acc |= BIT_ULL(13) | (3ULL << 17) | (3ULL << 25) | BIT_ULL(32) | BIT_ULL(34);
+	acc |= (3ULL << 13) | (2ULL << 15) | (3ULL << 17) | (3ULL << 25) | BIT_ULL(32) | BIT_ULL(34);
 	asm volatile("msr s3_5_c15_c6_0, %0" :: "r"(acc));
 	asm volatile("mrs %0, s3_5_c15_c5_0" : "=r"(cyc));
 	/* macOS writes exactly 0x3000001: FIQ/IRQ mode 0, WFI mode 3, WFI retention off */
@@ -776,6 +782,7 @@ static int lab_s2r_run(void)
 	}
 	if (lab_s2r_floor & 4)
 		writel(4, req + (LAB_PMGR_SLEEP_REQ & ~PAGE_MASK));
+	LAB_DELAY(1);
 	if (lab_s2r_floor & 1) {
 		ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpw));
 		pr_emerg("lab_s2r_floor: MBSE=slpw %d\n", ret);
@@ -798,6 +805,7 @@ static int lab_s2r_run(void)
 		lab_force_fabric_off();
 	if (lab_s2r_floor & 128)
 		lab_dump_ps("before-slpa");
+	LAB_DELAY(2);
 	if (lab_s2r_floor & 64) {
 		ret = lab_rtkit_aop_ap_idle();
 		pr_emerg("lab_s2r_floor: AOP SetAPPower(IDLE) %d\n", ret);
@@ -809,6 +817,7 @@ static int lab_s2r_run(void)
 	}
 	if ((lab_s2r_floor & 8) && lab_post_fast) {
 		lab_replay_post_slpa_fast();
+		LAB_DELAY(3);
 		if (lab_afnc_map) {
 			u32 a2, a3, b2, b3;
 
