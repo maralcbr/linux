@@ -572,8 +572,17 @@ static void lab_ps_switch_off(unsigned int grpmask)
 
 /* LAB ONLY: macOS's SEP sleep message (control endpoint 0, opcode 0x0c, param 2), traced under the hv. */
 #define LAB_SEP_MBOX		0x396408000ULL
+extern int lab_sep_sleep_request(void) __weak;
 static void lab_sep_sleep(void)
 {
+	if (lab_sep_sleep_request) {
+		int rc = lab_sep_sleep_request();
+
+		pr_emerg("lab_sep: sleep via apple_sep: %d\n", rc);
+		if (rc != -ENODEV)
+			return;
+	}
+	{
 	void __iomem *m = ioremap_np(LAB_SEP_MBOX, 0x1000);
 	u64 r0 = 0, r1 = 0;
 	int i, drained = 0;
@@ -600,6 +609,7 @@ static void lab_sep_sleep(void)
 	}
 	pr_emerg("lab_sep: sleep sent, reply after %d ms: %016llx %016llx (macOS: 0000000000010700)\n", i, r0, r1);
 	iounmap(m);
+	}
 }
 
 static void lab_dump_wdt(const char *when)

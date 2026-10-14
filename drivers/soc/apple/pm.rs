@@ -43,6 +43,18 @@ unsafe extern "C" fn pm_event(entering: bool) {
     }
 }
 
+/// LAB ONLY: called by macsmc-reboot's sleep replay after `MBSE = slpw`.
+#[no_mangle]
+pub extern "C" fn lab_sep_sleep_request() -> c_int {
+    let ptr = SEP.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return ENODEV.to_errno();
+    }
+    // SAFETY: as in `pm_event`; the pointer stays live while registered.
+    let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
+    sep.lab_sleep()
+}
+
 pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
     let ptr = sep.into_foreign();
 

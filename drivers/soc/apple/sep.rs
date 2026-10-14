@@ -1129,6 +1129,18 @@ impl SepData {
         }
     }
 
+    /// LAB ONLY: send macOS's control-endpoint sleep notification and log the reply.
+    pub(crate) fn lab_sleep(&self) -> i32 {
+        match self.control_request(&proto::op_lab_sleep()) {
+            Ok(Some(r)) => {
+                dev_info!(self.dev, "lab: sleep acknowledged (tag {:#04x}, data {:#010x})\n", r.tag, r.data_lo);
+                0
+            }
+            Ok(None) => ETIMEDOUT.to_errno(),
+            Err(e) => e.to_errno(),
+        }
+    }
+
     fn get_entropy_word(&self) -> Result<u32> {
         let op = proto::op_get_entropy();
         if !op.uses_reserved_tag() {

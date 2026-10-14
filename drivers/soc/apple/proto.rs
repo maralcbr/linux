@@ -135,6 +135,20 @@ pub(crate) fn op_nop(param: u8) -> ControlOp {
     }
 }
 
+/// LAB ONLY: macOS's sleep notification on the control endpoint (type 0x0c,
+/// param 2), traced under the m1n1 hypervisor; macOS gets a type 0x01 reply.
+pub(crate) fn op_lab_sleep() -> ControlOp {
+    ControlOp {
+        ty: 0x0c,
+        param: 0x02,
+        data: 0,
+        expect_reply: true,
+        timeout_ms: 500,
+        reserved_tag: false,
+        name: c"LAB_SLEEP",
+    }
+}
+
 pub(crate) fn op_security_mode() -> ControlOp {
     ControlOp {
         ty: 0x14,
