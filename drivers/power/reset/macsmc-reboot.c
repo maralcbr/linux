@@ -595,6 +595,27 @@ static void lab_pcie_ports_down(void)
 			 n, a, readl(p + 0x800), r, readl(p + 0x810), s, readl(p + 0x814), readl(p + 0x804));
 		iounmap(p);
 	}
+	{
+		void __iomem *rc = ioremap_np(0x580000000ULL, 0x100000);
+
+		if (!rc)
+			return;
+		for (n = 0; n < 4; n++) {
+			void __iomem *l = rc + 0x84000 + 0x4000 * n;
+			u32 c = readl(l);
+
+			writel(c & ~(BIT(0) | BIT(1) | BIT(9) | BIT(10)), l);
+			pr_emerg("lab_pcie: lane%d cfg %08x->%08x\n", n, c, readl(l));
+		}
+		pr_emerg("lab_pcie: rc phyif %08x ctl %08x fabric %08x\n",
+			 readl(rc + 0x24), readl(rc + 0x50), readl(rc + 0x4000));
+		writel(readl(rc + 0x24) & ~BIT(0), rc + 0x24);
+		writel(readl(rc + 0x50) & ~BIT(0), rc + 0x50);
+		udelay(100);
+		pr_emerg("lab_pcie: rc stopped: phyif %08x/%08x ctl %08x stat %08x\n",
+			 readl(rc + 0x24), readl(rc + 0x28), readl(rc + 0x50), readl(rc + 0x58));
+		iounmap(rc);
+	}
 }
 
 /* LAB ONLY: force the PCIe/fabric domains macOS has gated to target 0, children first. */
