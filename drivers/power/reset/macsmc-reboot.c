@@ -458,9 +458,22 @@ static void lab_floor_cpu(void *unused)
 
 static int lab_s2r_run(void);
 
+static void lab_afnc(const char *tag);
 static int lab_s2r_prepare(void)
 {
+	lab_afnc("s2idle-prepare(before suspend_late/noirq)");
 	return (lab_s2r_floor & 16) ? lab_s2r_run() : 0;
+}
+
+/* LAB ONLY: afnc2_lw1 / afnc3_lw0 PMGR state at a replay milestone */
+static void lab_afnc(const char *tag)
+{
+	void __iomem *p = ioremap_np(0x28e580000ULL, PAGE_SIZE);
+
+	if (!p)
+		return;
+	pr_emerg("lab_afnc %s: afnc2 %08x afnc3 %08x\n", tag, readl(p + 0x160), readl(p + 0x178));
+	iounmap(p);
 }
 
 static int lab_s2r_prepare_late(void)
@@ -782,6 +795,7 @@ static int lab_s2r_run(void)
 	}
 	if (lab_s2r_floor & 4)
 		writel(4, req + (LAB_PMGR_SLEEP_REQ & ~PAGE_MASK));
+	lab_afnc("entry");
 	LAB_DELAY(1);
 	if (lab_s2r_floor & 1) {
 		ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpw));
@@ -799,12 +813,15 @@ static int lab_s2r_run(void)
 		lab_sep_sleep();
 	if (lab_s2r_floor & (256 | 512 | 1024))
 		lab_ps_switch_off(((lab_s2r_floor >> 8) & 7));
+	lab_afnc("before-pcie");
 	if (lab_s2r_floor & 8192)
 		lab_pcie_ports_down();
+	lab_afnc("after-pcie");
 	if (lab_s2r_floor & 4096)
 		lab_force_fabric_off();
 	if (lab_s2r_floor & 128)
 		lab_dump_ps("before-slpa");
+	lab_afnc("after-slpw-keys-pmp-sep");
 	LAB_DELAY(2);
 	if (lab_s2r_floor & 64) {
 		ret = lab_rtkit_aop_ap_idle();
