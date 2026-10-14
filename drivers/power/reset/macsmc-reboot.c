@@ -336,6 +336,7 @@ module_param(lab_post_fast, bool, 0644);
 MODULE_PARM_DESC(lab_post_fast, "LAB ONLY: replay post-slpa writes back to back (pre-mapped, no prints or delays)");
 
 static void __iomem *lab_post_map[ARRAY_SIZE(lab_post_slpa)];
+static void __iomem *lab_afnc_map;
 
 static void lab_replay_post_slpa_fast(void)
 {
@@ -749,6 +750,7 @@ static int lab_s2r_run(void)
 	if ((lab_s2r_floor & 8) && lab_post_fast) {
 		int i;
 
+		lab_afnc_map = ioremap_np(0x28e580000ULL, PAGE_SIZE);
 		for (i = 0; i < ARRAY_SIZE(lab_post_slpa); i++) {
 			lab_post_map[i] = ioremap_np(lab_post_slpa[i].addr & PAGE_MASK, PAGE_SIZE);
 			if (lab_post_map[i])
@@ -800,6 +802,12 @@ static int lab_s2r_run(void)
 	}
 	if ((lab_s2r_floor & 8) && lab_post_fast) {
 		lab_replay_post_slpa_fast();
+		if (lab_afnc_map) {
+			mdelay(5);
+			pr_emerg("lab_post: afnc2 %08x afnc3 %08x sio %08x sep %08x\n",
+				 readl(lab_afnc_map + 0x160), readl(lab_afnc_map + 0x178),
+				 readl(lab_afnc_map + 0x180), readl(lab_afnc_map + 0xc00));
+		}
 		if (lab_s2r_floor & 2) {
 			smp_call_function(lab_floor_cpu, NULL, 0);
 			lab_floor_cpu(NULL);
