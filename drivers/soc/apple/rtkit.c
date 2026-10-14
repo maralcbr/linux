@@ -4,6 +4,7 @@
  * Copyright (C) The Asahi Linux Contributors
  */
 
+#include <linux/delay.h>
 #include "rtkit-internal.h"
 
 /* LAB ONLY: the AOP's RTKit instance, so the sleep experiments can set its AP power state. */
