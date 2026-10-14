@@ -211,7 +211,8 @@ static void macsmc_power_init_error_counts(struct macsmc_reboot *reboot)
  * stays asleep until the lab's out-of-band reset. bit0 = SMC keys,
  * bit1 = CPU power-down, bit2 = PMGR/PMP register writes, bit3 = the
  * post-slpa PMGR/watchdog/error-handler writes, bit4 = run from s2idle
- * prepare instead of prepare_late, bit5 = disable all three SoC watchdog channels, bit6 = tell the AOP the AP is idle before slpa, bit7 = dump every PMGR power-state register before slpa.
+ * prepare instead of prepare_late, bit5 = disable all three SoC watchdog channels, bit6 = tell the AOP the AP is idle before slpa, bit7 = dump every PMGR power-state register before slpa, bits 8-10 = switch
+ * off the domains macOS has off (8 devices/display/ATC, 9 PMP, 10 SEP).
  */
 static unsigned int lab_s2r_floor;
 module_param(lab_s2r_floor, uint, 0644);
@@ -514,6 +515,60 @@ static void lab_dump_ps(const char *when)
 	}
 }
 
+
+/* PMGR power states Linux leaves on but macOS has off at sleep entry (j314s, hv dump), with macOS's value. */
+static const struct { u64 addr; u32 val; u8 grp; } lab_ps_off[] = {
+	{ 0x28e080138ULL, 0x1400024f, 1 },	/* PCIE0_REF */
+	{ 0x28e080220ULL, 0x1000030f, 1 },	/* AFNC1_LW2 */
+	{ 0x28e080240ULL, 0x00000300, 1 },	/* ATC1_COMMON */
+	{ 0x28e080258ULL, 0x00000300, 1 },	/* DISPEXT0_FE */
+	{ 0x28e080260ULL, 0x00000300, 1 },	/* DISPEXT1_FE */
+	{ 0x28e080280ULL, 0x0f040300, 1 },	/* DISPEXT0_CPU0 */
+	{ 0x28e0802a8ULL, 0x0f040300, 1 },	/* DISPEXT1_CPU0 */
+	{ 0x28e0802d8ULL, 0x0f0f0300, 2 },	/* PMP */
+	{ 0x28e0802e0ULL, 0x0f000300, 2 },	/* PMS_SRAM */
+	{ 0x28e0802f8ULL, 0x00000300, 1 },	/* ATC2_COMMON */
+	{ 0x28e080300ULL, 0x00000300, 1 },	/* ATC3_COMMON */
+	{ 0x28e080320ULL, 0x1000030f, 1 },	/* APCIE_GP_SYS */
+	{ 0x28e080330ULL, 0x00000300, 1 },	/* ATC0_PCIE */
+	{ 0x28e080340ULL, 0x00000300, 1 },	/* ATC1_PCIE */
+	{ 0x28e080350ULL, 0x00000300, 1 },	/* ATC2_PCIE */
+	{ 0x28e080360ULL, 0x00000300, 1 },	/* ATC3_PCIE */
+	{ 0x28e580160ULL, 0x1000030f, 1 },	/* AFNC2_LW1 */
+	{ 0x28e580178ULL, 0x1000030f, 1 },	/* AFNC3_LW0 */
+	{ 0x28e580250ULL, 0x00000200, 1 },	/* UART2 */
+	{ 0x28e580258ULL, 0x00000200, 1 },	/* UART3 */
+	{ 0x28e580260ULL, 0x00000200, 1 },	/* UART4 */
+	{ 0x28e580268ULL, 0x00000200, 1 },	/* UART6 */
+	{ 0x28e580270ULL, 0x00000200, 1 },	/* UART7 */
+	{ 0x28e580328ULL, 0x00000300, 1 },	/* DISP0_FE */
+	{ 0x28e580350ULL, 0x0f040300, 1 },	/* DISP0_CPU0 */
+	{ 0x28e580c00ULL, 0x1000030f, 4 },	/* SEP */
+	{ 0x292280068ULL, 0x1400024f, 1 },	/* NUB_SPMI1 */
+	{ 0x292280078ULL, 0x00000200, 1 },	/* MSG */
+	{ 0x292280090ULL, 0x00000300, 1 },	/* ATC1_USB_AON */
+	{ 0x292280098ULL, 0x00000300, 1 },	/* ATC2_USB_AON */
+	{ 0x2922800a0ULL, 0x00000300, 1 },	/* ATC3_USB_AON */
+};
+
+static void lab_ps_switch_off(unsigned int grpmask)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(lab_ps_off); i++) {
+		void __iomem *p;
+
+		if (!(lab_ps_off[i].grp & grpmask))
+			continue;
+		p = ioremap_np(lab_ps_off[i].addr & PAGE_MASK, PAGE_SIZE);
+		if (!p)
+			continue;
+		writel(lab_ps_off[i].val, p + (lab_ps_off[i].addr & ~PAGE_MASK));
+		iounmap(p);
+	}
+	pr_emerg("lab_s2r_floor: switched off PMGR domains (groups %x)\n", grpmask);
+}
+
 static void lab_dump_wdt(const char *when)
 {
 	void __iomem *w = ioremap_np(0x2922b0000ULL, 0x40);
@@ -584,6 +639,8 @@ static int lab_s2r_run(void)
 		writeq(1ULL << 61, dvfs + (LAB_PMP_DVFS4 & ~PAGE_MASK));
 		writel(1, req + (LAB_PMGR_SLEEP_REQ & ~PAGE_MASK));
 	}
+	if (lab_s2r_floor & (256 | 512 | 1024))
+		lab_ps_switch_off(((lab_s2r_floor >> 8) & 7));
 	if (lab_s2r_floor & 128)
 		lab_dump_ps("before-slpa");
 	if (lab_s2r_floor & 64) {
