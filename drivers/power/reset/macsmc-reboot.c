@@ -696,6 +696,24 @@ static void lab_force_fabric_off(void)
 	}
 }
 
+/* LAB ONLY: AP wake-source masks (set bit = source masked) at 0x292004008..0x292004020, macOS's configured values. */
+static void lab_wake_masks(void)
+{
+	static const u32 mask[] = { 0xf3ffafff, 0xffa1f6ff, 0xfbdfffff, 0x3fffffff, 0xffffffc0, 0xffffffff, 0x00001fff };
+	void __iomem *p = ioremap_np(0x292004000ULL, 0x1000);
+	int i;
+
+	if (!p)
+		return;
+	for (i = 0; i < ARRAY_SIZE(mask); i++) {
+		u32 before = readl(p + 8 + 4 * i);
+
+		writel(mask[i], p + 8 + 4 * i);
+		pr_emerg("lab_wake: %#x %08x -> %08x\n", 0x292004008 + 4 * i, before, readl(p + 8 + 4 * i));
+	}
+	iounmap(p);
+}
+
 extern int lab_sep_sleep_request(void) __weak;
 static void lab_sep_sleep(void)
 {
@@ -812,6 +830,8 @@ static int lab_s2r_run(void)
 			pr_emerg("lab_s2r_floor: error handlers masked before the handshake\n");
 		}
 	}
+	if (lab_s2r_floor & 32768)
+		lab_wake_masks();
 	if (lab_s2r_floor & 16384) {
 		ret = lab_rtkit_ans_shutdown();
 		pr_emerg("lab_s2r_floor: ANS RTKit shutdown %d\n", ret);
